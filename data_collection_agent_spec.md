@@ -26,7 +26,7 @@ Each skill is agentic in nature, meaning LLM is responsible for on-the fly code 
 ## TECHNICAL CONTRACT
 
 ``` python
-from data_collection_agent import DataCollectionAgent
+from agents import DataCollectionAgent
 
 agent = DataCollectionAgent(config='config.yaml')
 
@@ -64,7 +64,7 @@ df = agent.run(
 
 ## REPOSITORY STRUCTURE
 
-    agents/data_collection_agent.py   — main agent file
+    agents/data_collection/data_collection_agent.py   — main agent file
     config.yaml                       — data source configuration
     notebooks/eda.ipynb               — EDA and visualizations
     data/raw/                         — collected data

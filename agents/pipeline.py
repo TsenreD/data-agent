@@ -1,6 +1,6 @@
 from typing import Any, Iterable
 
-from agents.base import AgentResult, BaseAgent
+from .base import AgentResult, BaseAgent
 
 
 class PipelineRunner:

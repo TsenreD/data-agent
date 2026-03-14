@@ -27,41 +27,64 @@ Collected rows are normalized to these columns:
 
 `metadata` stores source-specific fields that are not part of the core schema.
 
-## Run
+## Install
 
-Install dependencies:
+Create a Python 3.11 virtual environment and install the package:
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+python -m pip install --upgrade pip
+python -m pip install .
+```
+
+For local development:
+
+```bash
+python -m pip install -e ".[dev]"
 ```
 
 Build the execution image used for agentic sources:
 
 ```bash
-docker build -t data-agent-execution-backend:latest -f dockerfiles/data_collection_agent/Dockerfile dockerfiles/data_collection_agent
+docker build -t data-agent-execution-backend:latest -f agents/data_collection/Dockerfile.sandbox agents/data_collection
 ```
 
-Run the collection agent:
+## Run
+
+Run the installed CLI:
+
+```bash
+source .venv/bin/activate
+MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml
+```
+
+Optional preview:
+
+```bash
+MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml --print-head 5
+```
+
+Run the collection agent from Python:
 
 ```python
-from data_collection_agent import DataCollectionAgent
-from models import OllamaAdapter
+from agents import DataCollectionAgent
 
-agent = DataCollectionAgent(
-    config="config.yaml",
-    model=OllamaAdapter(model="llama3.1"),
-)
+agent = DataCollectionAgent(config="config.yaml")
 df = agent.run()
 print(df.head())
 ```
 
+Runtime prerequisites outside Python packaging:
+
+- an OpenAI-compatible model endpoint must already be available at the `llm.base_url` configured in `config.yaml`
+- Docker must be available for sandboxed execution of generated scraping code
+- per-agent runtime logs are written under `logs/` by default
+
 Run inside a sequential pipeline:
 
 ```python
-from agents import DataCollectionAgent
-from pipeline import PipelineRunner
+from agents import DataCollectionAgent, PipelineRunner
 
 runner = PipelineRunner([DataCollectionAgent("config.yaml")])
 result = runner.run()
@@ -69,11 +92,6 @@ print(result.dataframe_path)
 ```
 
 ## Source configuration
-
-`config.yaml` currently includes:
-
-- one Hugging Face source: `imdb`
-- one API source: `jsonplaceholder` comments
 
 Supported source types in v1:
 

@@ -5,7 +5,7 @@ project:
 llm:
   provider: ollama
   model: kimi-k2.5:cloud
-  base_url: http://localhost:11434
+  base_url: http://localhost:11434/v1/chat/completions
 
 sources:
   - type: hf_dataset

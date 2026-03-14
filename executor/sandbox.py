@@ -14,6 +14,42 @@ from typing import Any
 import pandas as pd
 
 
+SAFE_STANDARD_LIBRARY_IMPORTS = {
+    "base64",
+    "binascii",
+    "collections",
+    "copy",
+    "csv",
+    "dataclasses",
+    "datetime",
+    "decimal",
+    "enum",
+    "fractions",
+    "functools",
+    "hashlib",
+    "html",
+    "http",
+    "itertools",
+    "json",
+    "logging",
+    "math",
+    "operator",
+    "pprint",
+    "random",
+    "re",
+    "statistics",
+    "string",
+    "textwrap",
+    "time",
+    "traceback",
+    "types",
+    "typing",
+    "urllib",
+    "uuid",
+    "xml",
+}
+
+
 @dataclass(slots=True)
 class ExecutionResult:
     success: bool
@@ -49,13 +85,9 @@ class SandboxExecutor:
         self.container_name_prefix = container_name_prefix
         self.allowed_imports = allowed_imports or {
             "bs4",
-            "collections",
-            "datetime",
-            "json",
-            "math",
             "pandas",
-            "re",
             "requests",
+            *SAFE_STANDARD_LIBRARY_IMPORTS,
         }
         self._workspace_dir: tempfile.TemporaryDirectory[str] | None = None
         self._workspace_root: Path | None = None

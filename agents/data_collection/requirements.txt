@@ -37,6 +37,10 @@ click
 pytest
 pytest-asyncio
 ipython
+bs4
+colorama
+selenium
+selenium-stealth
 black
 ruff
 mypy

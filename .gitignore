@@ -22,6 +22,9 @@ htmlcov/
 data/raw/*
 !data/raw/.gitkeep
 
+logs/*
+!logs/.gitkeep
+
 dist/
 build/
 *.egg-info/

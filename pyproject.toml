@@ -17,8 +17,25 @@ dependencies = [
   "requests>=2.32",
 ]
 
+[project.scripts]
+data-agent = "cli:main"
+data-agent-collect = "cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "black>=24.0",
+  "ipython>=8.0",
+  "mypy>=1.8",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5",
+]
+
 [tool.setuptools]
-py-modules = ["data_collection_agent", "pipeline"]
+py-modules = ["cli"]
 
 [tool.setuptools.packages.find]
 include = ["agents*", "analysis*", "executor*", "models*"]
+
+[tool.setuptools.package-data]
+"agents.data_collection" = ["SKILLS.md"]

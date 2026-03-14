@@ -60,6 +60,14 @@ $requirements
 
 Do not assume access to project-local Python modules inside generated code.
 
+Generated code must be plain Python source only.
+
+- Do not wrap the code in Markdown fences.
+- Do not return explanations before or after the code.
+- Define exactly one entrypoint: `run(context)`.
+- `run(context)` must read inputs from `context["source"]`.
+- `run(context)` must return a `pandas.DataFrame`, not a list, dict, or helper function.
+
 ## Scraping Behavior
 
 For `scrape` sources:
@@ -71,6 +79,7 @@ For `scrape` sources:
 - honor optional `attribute`
 - honor optional `limit`
 - return a DataFrame containing extracted records
+- keep helper functions optional, but all execution must flow through `run(context)`
 
 If only one meaningful value is extracted per element, prefer a `text` column.
 

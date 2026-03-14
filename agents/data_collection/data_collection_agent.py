@@ -1,15 +1,17 @@
 import json
+import ast
+import re
 from string import Template
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+import sys
 
 import pandas as pd
 import requests
 import yaml
 
-from analysis.eda import generate_eda_report
 from executor.sandbox import SandboxExecutor
 from models.base import BaseModelAdapter
 from models.ollama_adapter import OllamaAdapter
@@ -37,13 +39,18 @@ class DataCollectionAgent(BaseAgent):
         model: BaseModelAdapter | None = None,
         sandbox: SandboxExecutor | None = None,
         output_dir: str | Path = "data/raw",
+        log_dir: str | Path = "logs",
     ) -> None:
         self.config = self._load_config(config)
         self.model = model or self._build_default_model()
         self.sandbox = sandbox or SandboxExecutor()
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         self._sandbox_session_active = False
+        self._active_log_path: Path | None = None
+        self._active_logs: list[str] | None = None
 
     def __enter__(self) -> "DataCollectionAgent":
         self.sandbox.start()
@@ -66,14 +73,17 @@ class DataCollectionAgent(BaseAgent):
 
     def execute(self, payload: Mapping[str, Any] | None = None) -> AgentResult:
         sandbox_owned_here = False
+        logs: list[str] = []
+        log_path = self._start_log_session(logs)
+        self._record_log("Starting DataCollectionAgent execution.", logs)
         if not self._sandbox_session_active:
             self.sandbox.start()
             sandbox_owned_here = True
+            self._record_log("Sandbox session started for this execution.", logs)
 
         try:
             sources = self._resolve_sources(payload)
             collected_frames: list[pd.DataFrame] = []
-            logs: list[str] = []
             failed_sources: list[dict[str, Any]] = []
             source_attempts: dict[str, list[dict[str, Any]]] = {}
 
@@ -82,9 +92,10 @@ class DataCollectionAgent(BaseAgent):
                 if source_type not in SUPPORTED_SOURCE_TYPES:
                     raise ValueError(f"Unsupported source type '{source_type}'.")
 
-                source_result = self._collect_source(source)
-                logs.extend(source_result.logs)
                 source_key = self._source_key(source)
+                self._record_log(f"Starting source {source_key} ({source_type}).", logs)
+                source_result = self._collect_source(source)
+                self._record_existing_logs(source_result.logs, logs)
                 if source_result.attempts:
                     source_attempts[source_key] = source_result.attempts
                 if not source_result.success:
@@ -95,20 +106,29 @@ class DataCollectionAgent(BaseAgent):
                             "reason": source_result.logs[-1] if source_result.logs else "Collection failed.",
                         }
                     )
+                    self._record_log(f"Source {source_key} failed; continuing with remaining sources.", logs)
                     continue
 
                 frame = source_result.dataframe
                 normalized = self._normalize_frame(frame, source)
                 collected_frames.append(normalized)
-                logs.append(f"Collected {len(normalized)} rows from {source_key}")
+                self._record_log(f"Collected {len(normalized)} rows from {source_key}.", logs)
 
             merged = self.merge(collected_frames)
             dataset_path = self.output_dir / "unified_dataset.jsonl"
             merged.to_json(dataset_path, orient="records", lines=True, force_ascii=False)
+            self._record_log(f"Wrote merged dataset to {dataset_path}.", logs)
+
+            from analysis.eda import generate_eda_report
 
             metrics, artifacts = generate_eda_report(merged, self.output_dir / "eda")
             schema = {column: str(dtype) for column, dtype in merged.dtypes.items()}
             metrics["failed_sources"] = len(failed_sources)
+            self._record_log(
+                f"Generated EDA artifacts: {', '.join(sorted(artifacts)) if artifacts else 'none'}.",
+                logs,
+            )
+            self._record_log("DataCollectionAgent execution finished successfully.", logs)
 
             return AgentResult(
                 dataframe=merged,
@@ -121,11 +141,20 @@ class DataCollectionAgent(BaseAgent):
                     "sources": sources,
                     "failed_sources": failed_sources,
                     "source_attempts": source_attempts,
+                    "log_path": str(log_path),
                 },
             )
+        except Exception as error:
+            self._record_log(
+                f"DataCollectionAgent execution failed with {type(error).__name__}: {error}",
+                logs,
+            )
+            raise
         finally:
             if sandbox_owned_here:
                 self.sandbox.close()
+                self._record_log("Closed sandbox session owned by this execution.", logs)
+            self._end_log_session()
 
     def merge(self, sources: Sequence[pd.DataFrame]) -> pd.DataFrame:
         if not sources:
@@ -251,9 +280,19 @@ class DataCollectionAgent(BaseAgent):
         retry_on_empty = bool(source.get("retry_on_empty", skill == "scrape"))
 
         for attempt_number in range(1, max_attempts + 1):
+            self._record_log(
+                f"Starting {skill} attempt {attempt_number} for {self._source_key(source)}.",
+                logs,
+            )
             try:
                 response = self.model.chat(messages, json_schema=schema)
-                code = response["python_code"] if isinstance(response, dict) else str(response)
+                raw_code = response["python_code"] if isinstance(response, dict) else str(response)
+                code = self._prepare_generated_code(raw_code)
+                self._record_log(
+                    self._format_generated_code_log(skill, source, attempt_number, code),
+                    logs,
+                    already_formatted=True,
+                )
             except Exception as error:
                 attempt_record = {
                     "attempt": attempt_number,
@@ -267,7 +306,8 @@ class DataCollectionAgent(BaseAgent):
                     "row_count": 0,
                 }
                 attempts.append(attempt_record)
-                logs.extend(self._format_attempt_logs(skill, source, attempt_record))
+                for line in self._format_attempt_logs(skill, source, attempt_record):
+                    self._record_log(line, logs, already_formatted=True)
                 if attempt_number == max_attempts:
                     break
                 continue
@@ -286,7 +326,8 @@ class DataCollectionAgent(BaseAgent):
                 "row_count": int(len(execution.dataframe)),
             }
             attempts.append(attempt_record)
-            logs.extend(self._format_attempt_logs(skill, source, attempt_record))
+            for line in self._format_attempt_logs(skill, source, attempt_record):
+                self._record_log(line, logs, already_formatted=True)
 
             if execution.success and (len(execution.dataframe) > 0 or not retry_on_empty):
                 return SourceCollectionResult(
@@ -322,6 +363,8 @@ class DataCollectionAgent(BaseAgent):
         if skill == "scrape":
             return (
                 f"{base} "
+                "Return plain Python source only, with no Markdown fences. "
+                "The code must define run(context) as the only required entrypoint and run(context) must return a pandas.DataFrame. "
                 "For scraping: fetch the page from context['source']['url'], parse it with BeautifulSoup, "
                 "if context['source'] contains 'selector' then use it, otherwise infer a stable repeated record boundary "
                 "from the page structure before extracting rows. Honor optional 'attribute' and 'limit', and return a "
@@ -351,6 +394,7 @@ class DataCollectionAgent(BaseAgent):
         return (
             "The previous generated code did not produce an acceptable result. "
             "Revise the code and return only JSON with a new 'python_code' value.\n"
+            "The revised code must define run(context) and run(context) must return a pandas.DataFrame.\n"
             f"Source configuration:\n{json.dumps(dict(source), indent=2)}\n"
             f"Failure reason: {retry_reason}\n"
             f"stdout:\n{attempt_record.get('stdout') or '<empty>'}\n"
@@ -379,7 +423,130 @@ class DataCollectionAgent(BaseAgent):
                 f"{skill} attempt {attempt_record['attempt']} stderr for {source_key}: "
                 f"{attempt_record['stderr'].strip()}"
             )
+        if attempt_record.get("stdout"):
+            lines.append(
+                f"{skill} attempt {attempt_record['attempt']} stdout for {source_key}: "
+                f"{attempt_record['stdout'].strip()}"
+            )
         return lines
+
+    def _start_log_session(self, logs: list[str]) -> Path:
+        started_at = datetime.now(UTC)
+        agent_log_dir = self.log_dir / self._agent_log_dir_name()
+        agent_log_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{started_at.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        log_path = agent_log_dir / filename
+        collision_index = 1
+        while log_path.exists():
+            collision_index += 1
+            log_path = agent_log_dir / f"{started_at.strftime('%Y-%m-%d_%H-%M-%S')}-{collision_index}.log"
+        self._active_logs = logs
+        self._active_log_path = log_path
+        log_path.write_text("", encoding="utf-8")
+        return log_path
+
+    def _end_log_session(self) -> None:
+        self._active_logs = None
+        self._active_log_path = None
+
+    def _record_existing_logs(self, entries: Sequence[str], logs: list[str]) -> None:
+        for entry in entries:
+            if entry in logs:
+                continue
+            logs.append(entry)
+
+    def _record_log(
+        self,
+        message: str,
+        logs: list[str] | None = None,
+        already_formatted: bool = False,
+    ) -> str:
+        entry = message if already_formatted else f"[{datetime.now(UTC).isoformat()}] {message}"
+        target_logs = logs if logs is not None else self._active_logs
+        if target_logs is not None:
+            target_logs.append(entry)
+        if self._active_log_path is not None:
+            with self._active_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{entry}\n")
+        print(entry, file=sys.stdout, flush=True)
+        return entry
+
+    def _format_generated_code_log(
+        self,
+        skill: str,
+        source: Mapping[str, Any],
+        attempt_number: int,
+        code: str,
+    ) -> str:
+        source_key = self._source_key(source)
+        return (
+            f"{skill} attempt {attempt_number} generated code for {source_key}:\n"
+            f"{code.strip()}"
+        )
+
+    def _agent_log_dir_name(self) -> str:
+        name = self.__class__.__name__
+        snake_case = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+        return snake_case
+
+    def _prepare_generated_code(self, code: str) -> str:
+        stripped = code.strip()
+        if not stripped:
+            return stripped
+
+        try:
+            tree = ast.parse(stripped)
+        except SyntaxError:
+            return stripped
+
+        function_names = [
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        if "run" in function_names:
+            return stripped
+
+        helper_names = [
+            name
+            for name in function_names
+            if not name.startswith("_")
+        ]
+        if not helper_names:
+            return stripped
+
+        wrapper = self._build_run_wrapper(helper_names)
+        return f"{stripped}\n\n{wrapper}"
+
+    def _build_run_wrapper(self, helper_names: Sequence[str]) -> str:
+        helper_list = ", ".join(repr(name) for name in helper_names)
+        return (
+            "def run(context):\n"
+            f"    helper_names = [{helper_list}]\n"
+            "    last_error = None\n"
+            "    for helper_name in helper_names:\n"
+            "        helper = globals().get(helper_name)\n"
+            "        if not callable(helper):\n"
+            "            continue\n"
+            "        for args in ((context,), (context.get('source', {}),), tuple()):\n"
+            "            try:\n"
+            "                result = helper(*args)\n"
+            "            except TypeError as error:\n"
+            "                last_error = error\n"
+            "                continue\n"
+            "            if isinstance(result, pd.DataFrame):\n"
+            "                return result\n"
+            "            if isinstance(result, list):\n"
+            "                return pd.DataFrame(result)\n"
+            "            if isinstance(result, dict):\n"
+            "                return pd.DataFrame([result])\n"
+            "            if result is None:\n"
+            "                continue\n"
+            "            raise TypeError(f'Helper {helper_name} returned unsupported type {type(result).__name__}.')\n"
+            "    if last_error is not None:\n"
+            "        raise RuntimeError(f'Unable to adapt generated helper into run(context): {last_error}')\n"
+            "    raise RuntimeError('Generated code did not expose a callable helper that could be wrapped as run(context).')\n"
+        )
 
     def _normalize_frame(self, frame: pd.DataFrame, source: Mapping[str, Any]) -> pd.DataFrame:
         working = frame.copy()
