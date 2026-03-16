@@ -8,6 +8,8 @@ venv/
 env/
 ENV/
 
+config.yaml
+
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
