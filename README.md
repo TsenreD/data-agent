@@ -1,6 +1,6 @@
 # Data Collection Agent
 
-This repository contains a v1 `DataCollectionAgent` that collects data from multiple sources, normalizes it into a fixed schema, persists the merged dataset, and produces basic EDA artifacts. The intended downstream ML task for the sample configuration is text classification or sentiment-style labeling over heterogeneous text sources.
+This repository contains a `DataCollectionAgent` that collects data from multiple sources, normalizes it into a fixed schema, persists the merged dataset, and produces basic EDA artifacts. The intended downstream ML task for the sample configuration is text classification or sentiment-style labeling over heterogeneous text sources.
 
 ## Architecture
 
@@ -8,10 +8,10 @@ The project uses a sequential pipeline shape:
 
 - `PipelineRunner` orchestrates agents one at a time.
 - `DataCollectionAgent` handles source planning, collection, normalization, merge, persistence, and EDA.
-- `SandboxExecutor` runs model-generated extraction code inside Docker rather than on the host interpreter.
-- `OllamaAdapter` provides a thin wrapper around a local Ollama server.
+- `SmolagentsCollectionBackend` runs agentic web/API collection through `smolagents.CodeAgent`.
+- Deterministic connectors still handle Hugging Face datasets and local Kaggle exports directly.
 
-For v1, the top-level pipeline is plain Python rather than a graph framework. The agentic boundary stays inside the collection agent.
+The top-level pipeline is still plain Python rather than a graph framework, but the agentic boundary now sits on top of `smolagents.CodeAgent(executor_type="docker")` instead of project-local code generation.
 
 ## Unified schema
 
@@ -44,11 +44,7 @@ For local development:
 python -m pip install -e ".[dev]"
 ```
 
-Build the execution image used for agentic sources:
-
-```bash
-docker build -t data-agent-execution-backend:latest -f agents/data_collection/Dockerfile.sandbox agents/data_collection
-```
+The `smolagents` Docker executor builds from [agents/data_collection/Dockerfile](/Users/eadyagin/vscode/data-agent/agents/data_collection/Dockerfile) the first time it runs, unless the configured image already exists. That image preinstalls the scraping, browser, and notebook runtime used by model-generated code, and the agent allows imports from the installed environment.
 
 ## Run
 
@@ -78,8 +74,8 @@ print(df.head())
 Runtime prerequisites outside Python packaging:
 
 - an OpenAI-compatible model endpoint must already be available at the `llm.base_url` configured in `config.yaml`
-- Docker must be available for sandboxed execution of generated scraping code
-- per-agent runtime logs are written under `logs/` by default
+- Docker must be available for the remote code executor used by `smolagents`
+- web-enabled sources require outbound network access from the Python process and from the sandbox container
 
 Run inside a sequential pipeline:
 
@@ -97,15 +93,12 @@ Supported source types in v1:
 
 - `hf_dataset`
 - `api`
-- `scrape` via on-the-fly LLM code generation plus sandbox execution
+- `scrape` via `smolagents.CodeAgent` in Docker with model-generated Python scraping code
 - `kaggle_dataset` using a local exported file via `file_path`
 
-Scraping is always agentic in v1: the model generates Python extraction code at runtime, and the sandbox executes it to produce the `DataFrame`. `api` sources can still use the deterministic connector by default, or opt into the same model-generated path with `agentic: true`.
+Scraping is always agentic: `smolagents.CodeAgent` runs generated Python inside Docker and the model writes the scraping logic directly with prebaked libraries such as `requests` and `beautifulsoup4`. `api` sources still use the deterministic connector by default, or can opt into the same Docker-backed custom-code path with `agentic: true`.
 
-For agentic sources, the sandbox never raises exceptions back into the agent. It returns structured execution results with `stdout`, `stderr`, exit status, and error details so the agent can retry with revised code. Use `max_attempts` and `retry_on_empty` in a source config to control that loop.
-Attempt history is returned in `AgentResult.metadata["source_attempts"]`.
-
-The executor expects a Docker image with Python plus the allowed libraries. By default it uses `data-agent-execution-backend:latest`; override this with `DATA_AGENT_SANDBOX_IMAGE` if needed. The executor starts one or more long-lived sandbox containers for the duration of an agent run and reuses them across retries instead of launching a fresh container for every attempt. Network is disabled by default at the sandbox level and only opened for sources with `allow_network: true` or for `scrape` / `api` sources by default.
+For agentic sources, attempt history is returned in `AgentResult.metadata["source_attempts"]`. Use `max_attempts`, `max_steps`, and `retry_on_empty` in a source config to control behavior. Docker executor settings can be supplied under `llm.sandbox`, for example `image_name`, `build_new_image`, `memory_limit`, `cpu_limit`, `pids_limit`, and `port`.
 
 ## Outputs
 
@@ -118,8 +111,7 @@ The notebook scaffold lives at `notebooks/eda.ipynb`.
 
 ## Limitations
 
-- The sandbox is container-based and materially safer than host subprocess execution, but it is still not equivalent to a VM or microVM boundary.
 - Kaggle support is intentionally narrow in v1 and expects a local export path.
 - Audio and image EDA are left as the next increment; text EDA is implemented now.
-- Any run that includes a `scrape` source requires a configured model adapter such as `OllamaAdapter`.
-- Docker and a compatible execution image are required for agentic sources.
+- Any run that includes a `scrape` source requires a configured model for `smolagents`, plus a working Docker daemon.
+- Web search / page extraction quality still depends on the target site structure and model quality.

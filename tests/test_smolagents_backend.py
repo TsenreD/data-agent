@@ -1,0 +1,222 @@
+from agents.data_collection.smolagents_backend import (
+    AUTHORIZED_IMPORTS,
+    DEFAULT_SAFE_IMPORTS,
+    DOCKERFILE_PATH,
+    EFFECTIVE_AUTHORIZED_IMPORTS,
+    PrebakedDockerExecutor,
+    SmolagentsCollectionBackend,
+)
+from smolagents.agents import RunResult
+
+
+def test_normalize_api_base_strips_chat_completions_suffix() -> None:
+    assert (
+        SmolagentsCollectionBackend._normalize_api_base(
+            "http://localhost:11434/v1/chat/completions"
+        )
+        == "http://localhost:11434/v1"
+    )
+
+
+def test_parse_output_accepts_plain_json() -> None:
+    backend = SmolagentsCollectionBackend(model=object())
+    records, notes = backend._parse_output('{"records":[{"text":"hello","title":"greeting"}],"notes":["ok"]}')
+
+    assert records == [{"text": "hello", "title": "greeting"}]
+    assert notes == ["ok"]
+
+
+def test_parse_output_accepts_fenced_json() -> None:
+    backend = SmolagentsCollectionBackend(model=object())
+    records, notes = backend._parse_output('```json\n{"records":[{"text":"hello"}]}\n```')
+
+    assert records == [{"text": "hello"}]
+    assert notes == []
+
+
+def test_parse_output_accepts_python_literal_dict_string() -> None:
+    backend = SmolagentsCollectionBackend(model=object())
+    records, notes = backend._parse_output("{'records': [{'text': 'hello'}], 'notes': ['ok']}")
+
+    assert records == [{"text": "hello"}]
+    assert notes == ["ok"]
+
+
+def test_parse_output_accepts_direct_dict_output() -> None:
+    backend = SmolagentsCollectionBackend(model=object())
+    records, notes = backend._parse_output({"records": [{"text": "hello"}], "notes": ["ok"]})
+
+    assert records == [{"text": "hello"}]
+    assert notes == ["ok"]
+
+
+def test_build_task_requires_github_search_before_writing_code() -> None:
+    backend = SmolagentsCollectionBackend(model=object())
+
+    task = backend._build_task({"type": "scrape", "url": "https://example.com"})
+
+    assert "If the extraction pattern is unclear" in task
+    assert "Use `web_search` only if GitHub results are insufficient." in task
+    assert "not from search engine results" in task
+    assert "Do not use search-result snippets as `text`." in task
+    assert "final_answer(json.dumps" in task
+    assert "If the target page is an index, listing, archive, or landing page" in task
+    assert "do not stop at cataloging those links" in task
+    assert "best: one record per actual task/problem" in task
+
+
+def test_dockerfile_contains_local_requirements() -> None:
+    content = DOCKERFILE_PATH.read_text(encoding="utf-8")
+    requirements = [
+        "aiohttp",
+        "beautifulsoup4",
+        "ddgs",
+        "fastapi",
+        "httpx",
+        "markdownify",
+        "numpy",
+        "pandas",
+        "playwright",
+        "requests",
+        "scrapy",
+        "selenium",
+        "selenium-stealth",
+        "selectolax",
+        "trafilatura",
+    ]
+
+    for requirement in requirements:
+        assert requirement in content
+
+
+def test_dockerfile_contains_browser_runtime_dependencies() -> None:
+    content = DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+    assert "chromium" in content
+    assert "chromium-driver" in content
+    assert "playwright" in content
+    assert "xvfb" in content
+    assert "libgtk-3-0" in content
+
+
+def test_prebaked_executor_skips_runtime_package_installation() -> None:
+    executor = object.__new__(PrebakedDockerExecutor)
+    installed = executor.install_packages(["requests", "bs4"])
+
+    assert installed == ["requests", "bs4"]
+
+
+def test_all_imports_are_authorized() -> None:
+    assert "*" not in AUTHORIZED_IMPORTS
+    assert "json" in AUTHORIZED_IMPORTS
+    assert "os" in AUTHORIZED_IMPORTS
+    assert "pathlib" in AUTHORIZED_IMPORTS
+    assert "urllib.parse" in AUTHORIZED_IMPORTS
+    assert "requests" in AUTHORIZED_IMPORTS
+    assert "bs4" in AUTHORIZED_IMPORTS
+    assert "playwright.sync_api" in AUTHORIZED_IMPORTS
+    assert "selenium.webdriver.common.by" in AUTHORIZED_IMPORTS
+    assert "yaml" in AUTHORIZED_IMPORTS
+
+
+def test_effective_authorized_imports_include_smolagents_safe_defaults() -> None:
+    assert "datetime" in DEFAULT_SAFE_IMPORTS
+    assert "re" in DEFAULT_SAFE_IMPORTS
+    assert set(DEFAULT_SAFE_IMPORTS).issubset(EFFECTIVE_AUTHORIZED_IMPORTS)
+    assert "requests" in EFFECTIVE_AUTHORIZED_IMPORTS
+    assert "playwright.sync_api" in EFFECTIVE_AUTHORIZED_IMPORTS
+
+
+def test_backend_registers_search_tools() -> None:
+    backend = SmolagentsCollectionBackend(model=object())
+
+    assert [tool.name for tool in backend.tools] == ["web_search", "github_code_search"]
+
+
+def test_collect_passes_search_tools_to_code_agent(monkeypatch) -> None:
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class DummyAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            captured["tools"] = kwargs["tools"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def run(self, task, max_steps: int, return_full_result: bool):
+            return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
+
+    monkeypatch.setattr(
+        "agents.data_collection.smolagents_backend.PrebakedDockerExecutor",
+        DummyExecutor,
+    )
+    monkeypatch.setattr("agents.data_collection.smolagents_backend.CodeAgent", DummyAgent)
+
+    backend = SmolagentsCollectionBackend(model=object())
+    result = backend.collect({"type": "scrape", "url": "https://example.com"})
+
+    assert result.success is True
+    assert [tool.name for tool in captured["tools"]] == ["web_search", "github_code_search"]
+
+
+def test_collect_defaults_to_twenty_steps_per_attempt(monkeypatch) -> None:
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class DummyAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            captured["agent_max_steps"] = kwargs["max_steps"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def run(self, task, max_steps: int, return_full_result: bool):
+            captured["run_max_steps"] = max_steps
+            return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
+
+    monkeypatch.setattr(
+        "agents.data_collection.smolagents_backend.PrebakedDockerExecutor",
+        DummyExecutor,
+    )
+    monkeypatch.setattr("agents.data_collection.smolagents_backend.CodeAgent", DummyAgent)
+
+    backend = SmolagentsCollectionBackend(model=object())
+    result = backend.collect({"type": "scrape", "url": "https://example.com"})
+
+    assert result.success is True
+    assert captured["agent_max_steps"] == 20
+    assert captured["run_max_steps"] == 20
+
+
+def test_build_container_env_includes_github_token_from_flat_config() -> None:
+    backend = SmolagentsCollectionBackend(model=object(), llm_config={"github_token": "test-token"})
+
+    environment = backend._build_container_env()
+
+    assert environment["GITHUB_TOKEN"] == "test-token"
+
+
+def test_build_container_env_includes_github_token_from_nested_config() -> None:
+    backend = SmolagentsCollectionBackend(
+        model=object(),
+        llm_config={"github": {"token": "nested-token"}},
+    )
+
+    environment = backend._build_container_env()
+
+    assert environment["GITHUB_TOKEN"] == "nested-token"

@@ -8,7 +8,6 @@ venv/
 env/
 ENV/
 
-config.yaml
 
 .mypy_cache/
 .pytest_cache/
@@ -30,3 +29,4 @@ logs/*
 dist/
 build/
 *.egg-info/
+config.yaml

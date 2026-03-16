@@ -11,10 +11,17 @@ requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4>=4.12",
   "datasets>=2.20",
+  "ddgs>=9.0",
+  "docker>=7.1",
+  "httpx>=0.28",
   "matplotlib>=3.8",
+  "openai>=2.28",
   "pandas>=2.2",
   "pyyaml>=6.0",
   "requests>=2.32",
+  "scrapy>=2.11",
+  "smolagents>=1.24.0",
+  "websocket-client>=1.9",
 ]
 
 [project.scripts]
@@ -38,4 +45,4 @@ py-modules = ["cli"]
 include = ["agents*", "analysis*", "executor*", "models*"]
 
 [tool.setuptools.package-data]
-"agents.data_collection" = ["SKILLS.md"]
+"agents.data_collection" = ["Dockerfile", "SKILLS.md"]

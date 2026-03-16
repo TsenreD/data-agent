@@ -21,11 +21,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory where collected artifacts will be written.",
     )
     parser.add_argument(
-        "--log-dir",
-        default="logs",
-        help="Directory where per-agent runtime logs will be written.",
-    )
-    parser.add_argument(
         "--print-head",
         type=int,
         default=0,
@@ -43,7 +38,6 @@ def main() -> int:
             DataCollectionAgent(
                 config=Path(args.config),
                 output_dir=Path(args.output_dir),
-                log_dir=Path(args.log_dir),
             )
         ]
     )
@@ -54,7 +48,6 @@ def main() -> int:
         "dataframe_path": None if result.dataframe_path is None else str(result.dataframe_path),
         "failed_sources": result.metadata.get("failed_sources", []),
         "artifacts": result.artifacts,
-        "log_path": result.metadata.get("log_path"),
     }
     print(json.dumps(summary, indent=2))
 
