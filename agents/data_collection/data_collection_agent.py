@@ -1,3 +1,4 @@
+import json
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -9,7 +10,7 @@ import requests
 import yaml
 
 from ..base import AgentResult, BaseAgent
-from .smolagents_backend import SmolagentsCollectionBackend
+from .smolagents_backend import SmolagentsCollectionBackend, SmolagentsNotebookBackend
 
 
 UNIFIED_COLUMNS = ["text", "audio", "image", "label", "source", "collected_at", "metadata"]
@@ -29,11 +30,16 @@ class DataCollectionAgent(BaseAgent):
         self,
         config: str | Path | Mapping[str, Any],
         output_dir: str | Path = "data/raw",
+        notebook_path: str | Path = "notebooks/eda.ipynb",
     ) -> None:
         self.config = self._load_config(config)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.notebook_path = Path(notebook_path)
         self.collection_backend = SmolagentsCollectionBackend(
+            llm_config=self.config.get("llm", {}),
+        )
+        self.notebook_backend = SmolagentsNotebookBackend(
             llm_config=self.config.get("llm", {}),
         )
 
@@ -85,13 +91,28 @@ class DataCollectionAgent(BaseAgent):
             merged.to_json(dataset_path, orient="records", lines=True, force_ascii=False)
             self._record_log(f"Wrote merged dataset to {dataset_path}.", logs)
 
-            from analysis.eda import generate_eda_report
-
-            metrics, artifacts = generate_eda_report(merged, self.output_dir / "eda")
+            notebook_result = self.notebook_backend.generate_notebook(
+                frame=merged,
+                dataset_path=dataset_path,
+                notebook_path=self.notebook_path,
+            )
+            self._record_existing_logs(notebook_result.logs, logs)
+            if not notebook_result.success or notebook_result.notebook is None:
+                notebook_error = self._summarize_notebook_failure(notebook_result)
+                raise RuntimeError(f"EDA notebook generation failed: {notebook_error}")
+            self.notebook_path.parent.mkdir(parents=True, exist_ok=True)
+            self.notebook_path.write_text(
+                json.dumps(notebook_result.notebook, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             schema = {column: str(dtype) for column, dtype in merged.dtypes.items()}
-            metrics["failed_sources"] = len(failed_sources)
+            metrics = {
+                "row_count": int(len(merged)),
+                "failed_sources": len(failed_sources),
+            }
+            artifacts = {"eda_notebook": str(self.notebook_path)}
             self._record_log(
-                f"Generated EDA artifacts: {', '.join(sorted(artifacts)) if artifacts else 'none'}.",
+                f"Generated EDA notebook at {self.notebook_path}.",
                 logs,
             )
             self._record_log("DataCollectionAgent execution finished successfully.", logs)
@@ -107,6 +128,7 @@ class DataCollectionAgent(BaseAgent):
                     "sources": sources,
                     "failed_sources": failed_sources,
                     "source_attempts": source_attempts,
+                    "eda_notebook_notes": notebook_result.notes,
                 },
             )
         except Exception as error:
@@ -115,6 +137,7 @@ class DataCollectionAgent(BaseAgent):
                 logs,
             )
             raise
+
     def merge(self, sources: Sequence[pd.DataFrame]) -> pd.DataFrame:
         if not sources:
             return pd.DataFrame(columns=UNIFIED_COLUMNS)
@@ -257,7 +280,10 @@ class DataCollectionAgent(BaseAgent):
                     working[unified_name] = None
 
         metadata_columns = [column for column in working.columns if column not in {"text", "audio", "image", "label"}]
-        working["metadata"] = working[metadata_columns].to_dict(orient="records")
+        if metadata_columns:
+            working["metadata"] = working[metadata_columns].to_dict(orient="records")
+        else:
+            working["metadata"] = [{} for _ in range(len(working))]
         working["source"] = source.get("name") or source.get("url") or source.get("endpoint") or source["type"]
         working["collected_at"] = datetime.now(UTC).isoformat()
         return working[UNIFIED_COLUMNS]
@@ -296,3 +322,20 @@ class DataCollectionAgent(BaseAgent):
         path = Path(config)
         with path.open("r", encoding="utf-8") as handle:
             return yaml.safe_load(handle) or {}
+
+    def _summarize_notebook_failure(self, result: Any) -> str:
+        attempts = getattr(result, "attempts", []) or []
+        if attempts:
+            last_attempt = attempts[-1]
+            if last_attempt.get("error_message"):
+                return str(last_attempt["error_message"])
+            notes = last_attempt.get("notes") or []
+            if notes:
+                return " | ".join(str(note) for note in notes)
+        notes = getattr(result, "notes", []) or []
+        if notes:
+            return " | ".join(str(note) for note in notes)
+        logs = getattr(result, "logs", []) or []
+        if logs:
+            return str(logs[-1])
+        return "unknown notebook generation error"

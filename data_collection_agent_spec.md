@@ -66,6 +66,6 @@ df = agent.run(
 
     agents/data_collection/data_collection_agent.py   — main agent file
     config.yaml                       — data source configuration
-    notebooks/eda.ipynb               — EDA and visualizations
+    notebooks/eda.ipynb               — agent-generated executable EDA notebook
     data/raw/                         — collected data
     README.md

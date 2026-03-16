@@ -29,4 +29,3 @@ logs/*
 dist/
 build/
 *.egg-info/
-config.yaml

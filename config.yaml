@@ -2,19 +2,19 @@ project:
   name: text-sentiment-collection
   modality: text
 
-# llm:
-#   provider: ollama
-#   model: kimi-k2.5:cloud
-#   base_url: http://localhost:11434/v1/chat/completions
-#   github_token: 
-
-
 llm:
-  provider: gpt
-  model: gpt-5.4
-  api_key: 
-  base_url: https://api.aitunnel.ru/v1/
+  provider: ollama
+  model: kimi-k2.5:cloud
+  base_url: http://localhost:11434/v1/chat/completions
   github_token: 
+
+
+# llm:
+#   provider: gpt
+#   model: gpt-5.4
+#   api_key: 
+#   base_url: https://api.aitunnel.ru/v1/
+#   github_token: 
 
 
 
@@ -34,6 +34,7 @@ sources:
   #   allow_network: true
   #   max_attempts: 1
   #   retry_on_empty: true
+
   # - type: scrape # works
   #   name: aops-all-russian-olympiad 
   #   url: https://xn--b1ayi3a.xn--l1afu.xn--p1ai/upload/files/Arhive_tasks/2024-25/final/math/tasks-math-11-final-24-25.pdf
@@ -42,12 +43,12 @@ sources:
   #   max_attempts: 1
   #   retry_on_empty: true
 
-  - type: scrape
-    name: all-russian
-    url: https://vos.olimpiada.ru/2025/invite/tasks
-    limit: 200
-    allow_network: true
-    max_attempts: 1
-    retry_on_empty: true
+  # - type: scrape # works semi-well
+  #   name: all-russian
+  #   url: https://vos.olimpiada.ru/2025/invite/tasks
+  #   limit: 200
+  #   allow_network: true
+  #   max_attempts: 1
+  #   retry_on_empty: true
 
 

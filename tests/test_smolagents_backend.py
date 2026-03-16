@@ -2,9 +2,14 @@ from agents.data_collection.smolagents_backend import (
     AUTHORIZED_IMPORTS,
     DEFAULT_SAFE_IMPORTS,
     DOCKERFILE_PATH,
+    EDA_DOCKERFILE_PATH,
+    EDA_NOTEBOOK_IMPORTS,
     EFFECTIVE_AUTHORIZED_IMPORTS,
+    EFFECTIVE_EDA_NOTEBOOK_IMPORTS,
+    PROJECT_ROOT,
     PrebakedDockerExecutor,
     SmolagentsCollectionBackend,
+    SmolagentsNotebookBackend,
 )
 from smolagents.agents import RunResult
 
@@ -79,6 +84,7 @@ def test_dockerfile_contains_local_requirements() -> None:
         "playwright",
         "requests",
         "scrapy",
+        "seaborn",
         "selenium",
         "selenium-stealth",
         "selectolax",
@@ -87,6 +93,15 @@ def test_dockerfile_contains_local_requirements() -> None:
 
     for requirement in requirements:
         assert requirement in content
+
+
+def test_eda_dockerfile_contains_eda_requirements() -> None:
+    content = EDA_DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+    assert "matplotlib" in content
+    assert "numpy" in content
+    assert "pandas" in content
+    assert "seaborn" in content
 
 
 def test_dockerfile_contains_browser_runtime_dependencies() -> None:
@@ -127,6 +142,13 @@ def test_effective_authorized_imports_include_smolagents_safe_defaults() -> None
     assert "playwright.sync_api" in EFFECTIVE_AUTHORIZED_IMPORTS
 
 
+def test_effective_eda_imports_include_smolagents_safe_defaults() -> None:
+    assert "datetime" in DEFAULT_SAFE_IMPORTS
+    assert set(DEFAULT_SAFE_IMPORTS).issubset(EFFECTIVE_EDA_NOTEBOOK_IMPORTS)
+    assert "pandas" in EFFECTIVE_EDA_NOTEBOOK_IMPORTS
+    assert "seaborn" in EFFECTIVE_EDA_NOTEBOOK_IMPORTS
+
+
 def test_backend_registers_search_tools() -> None:
     backend = SmolagentsCollectionBackend(model=object())
 
@@ -144,6 +166,7 @@ def test_collect_passes_search_tools_to_code_agent(monkeypatch) -> None:
     class DummyAgent:
         def __init__(self, *args, **kwargs) -> None:
             captured["tools"] = kwargs["tools"]
+            captured["instructions"] = kwargs["instructions"]
 
         def __enter__(self):
             return self
@@ -165,6 +188,7 @@ def test_collect_passes_search_tools_to_code_agent(monkeypatch) -> None:
 
     assert result.success is True
     assert [tool.name for tool in captured["tools"]] == ["web_search", "github_code_search"]
+    assert "agentic collection layer" in captured["instructions"]
 
 
 def test_collect_defaults_to_twenty_steps_per_attempt(monkeypatch) -> None:
@@ -220,3 +244,31 @@ def test_build_container_env_includes_github_token_from_nested_config() -> None:
     environment = backend._build_container_env()
 
     assert environment["GITHUB_TOKEN"] == "nested-token"
+
+
+def test_notebook_backend_uses_restricted_import_set() -> None:
+    assert "pandas" in EDA_NOTEBOOK_IMPORTS
+    assert "seaborn" in EDA_NOTEBOOK_IMPORTS
+    assert "requests" not in EDA_NOTEBOOK_IMPORTS
+
+
+def test_notebook_backend_loads_skill_instructions() -> None:
+    backend = SmolagentsNotebookBackend(model=object())
+
+    assert "You generate a Jupyter notebook" in backend.instructions
+
+
+def test_notebook_backend_loads_inspection_instructions() -> None:
+    backend = SmolagentsNotebookBackend(model=object())
+
+    assert "You inspect the unified dataset" in backend.inspection_instructions
+
+
+def test_notebook_backend_uses_dedicated_sandbox_defaults() -> None:
+    backend = SmolagentsNotebookBackend(model=object())
+
+    kwargs = backend._build_executor_kwargs({"allow_network": False})
+
+    assert kwargs["image_name"] == "data-agent-eda-sandbox"
+    assert kwargs["port"] == 8890
+    assert kwargs["container_run_kwargs"]["volumes"][str(PROJECT_ROOT)]["bind"] == "/workspace"

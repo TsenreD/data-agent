@@ -92,6 +92,7 @@ RUN python3 -m pip install --upgrade pip setuptools wheel \
         rich \
         ruff \
         scrapy \
+        seaborn \
         selenium \
         selenium-stealth \
         selectolax \

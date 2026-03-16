@@ -20,6 +20,7 @@ dependencies = [
   "pyyaml>=6.0",
   "requests>=2.32",
   "scrapy>=2.11",
+  "seaborn>=0.13",
   "smolagents>=1.24.0",
   "websocket-client>=1.9",
 ]
@@ -42,7 +43,7 @@ dev = [
 py-modules = ["cli"]
 
 [tool.setuptools.packages.find]
-include = ["agents*", "analysis*", "executor*", "models*"]
+include = ["agents*", "executor*", "models*"]
 
 [tool.setuptools.package-data]
-"agents.data_collection" = ["Dockerfile", "SKILLS.md"]
+"agents.data_collection" = ["Dockerfile", "EdaDockerfile", "skills/*/SKILL.md"]
