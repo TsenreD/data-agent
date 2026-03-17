@@ -18,6 +18,7 @@ Base the notebook on actual observed data characteristics, not generic assumptio
 
 Notebook code may only import approved standard-library modules and these EDA libraries:
 
+- `IPython.display`
 - `numpy`
 - `pandas`
 - `matplotlib.pyplot`
@@ -45,6 +46,14 @@ Do not import anything else in notebook cells.
 - The notebook must target nbformat 4.
 - The notebook must contain at most 10 cells total.
 - Every code cell must have `execution_count: null` and `outputs: []`.
+- The first code cell must define the standard notebook aliases: `np`, `pd`, `plt`, `sns`, `Path`, and `display`.
+- Prefer this exact setup pattern in the first code cell:
+  - `from pathlib import Path`
+  - `import numpy as np`
+  - `import pandas as pd`
+  - `import matplotlib.pyplot as plt`
+  - `import seaborn as sns`
+  - `try: from IPython.display import display ...`
 - Use the dataset path provided in the task exactly as the notebook input path.
 - Do not use shell commands, `subprocess`, or arbitrary filesystem writes inside notebook code.
 - Do not use shell escapes like `!pip`.
@@ -58,8 +67,7 @@ Include concise markdown plus executable code that:
 - previews the dataframe and schema
 - summarizes nulls / missingness
 - analyzes label distribution when the `label` column has values
-- analyzes text length when the `text` column has values
-- computes and plots top words from text when possible
+- analyzes text-length distributions when the `text` column has values
 - uses defensive checks so the notebook still runs on sparse or partially empty datasets
 - only includes sections that are justified by the real dataset contents
 

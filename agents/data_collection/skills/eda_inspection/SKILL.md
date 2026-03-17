@@ -36,7 +36,7 @@ Include only useful high-signal fields such as:
 - non-null counts
 - missingness
 - label summary when `label` exists
-- text summary when `text` exists
+- text-length summary when `text` exists
 - source distribution when `source` exists
 - a short sample of metadata keys or example rows when helpful
 

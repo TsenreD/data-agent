@@ -73,11 +73,13 @@ RUN python3 -m pip install --upgrade pip setuptools wheel \
         openpyxl \
         orjson \
         pandas \
+        pdfminer.six \
         parsel \
         pdfplumber \
         pillow \
         playwright \
         pydantic \
+        PyMuPDF \
         pypdf \
         pytest \
         pytest-asyncio \

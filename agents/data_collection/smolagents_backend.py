@@ -24,8 +24,16 @@ JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile")
 EDA_DOCKERFILE_PATH = Path(__file__).with_name("EdaDockerfile")
+DEFAULT_SANDBOX_MEMORY_LIMIT = "512m"
+DEFAULT_SANDBOX_SHM_SIZE = "1g"
+DEFAULT_SANDBOX_CPU_LIMIT = 0.5
+DEFAULT_SANDBOX_PIDS_LIMIT = 100
 AUTHORIZED_IMPORTS = [
     "aiohttp",
+    "agents",
+    "agents.data_collection",
+    "agents.data_collection.pdf_utils",
+    "agents.data_collection.web_utils",
     "asyncio",
     "black",
     "bs4",
@@ -36,6 +44,7 @@ AUTHORIZED_IMPORTS = [
     "dotenv",
     "fake_useragent",
     "fastapi",
+    "fitz",
     "html",
     "html5lib",
     "httpx",
@@ -55,6 +64,8 @@ AUTHORIZED_IMPORTS = [
     "os",
     "pandas",
     "pathlib",
+    "pdfminer",
+    "pdfminer.high_level",
     "parsel",
     "pdfplumber",
     "PIL",
@@ -97,7 +108,31 @@ AUTHORIZED_IMPORTS = [
     "xlsxwriter",
     "yaml",
 ]
+PDF_EXTRACTION_HELPER = (
+    "For PDFs, import and use the deterministic helper instead of writing a parser from scratch:\n"
+    "`from agents.data_collection.pdf_utils import extract_pdf_text_from_url`\n"
+    "This helper already tries `PyMuPDF` (`fitz`) first, then `pdfplumber`, then "
+    "`pdfminer.high_level.extract_text`, and returns a dict with `method`, `text`, and `page_texts`.\n"
+    "If it returns `method == \"unparsed\"` or nearly empty text, treat the PDF as likely scanned/image-based and "
+    "report that clearly in `notes` instead of pretending extraction succeeded."
+)
+SITE_EXTRACTION_HELPER = (
+    "For normal webpages, import and use the deterministic helpers from "
+    "`agents.data_collection.web_utils` instead of inventing a parser stack from scratch.\n"
+    "Available helpers:\n"
+    "- `fetch_html(url)`: requests-based fetch with stable headers\n"
+    "- `extract_main_text(html, url=None)`: tries `trafilatura`, then falls back to `BeautifulSoup`\n"
+    "- `extract_links(html, base_url, ...)`: normalized link extraction with `BeautifulSoup`\n"
+    "- `fetch_rendered_html_selenium(url)`: browser-rendered fallback for JS-heavy pages\n"
+    "- `fetch_and_extract(url, use_selenium=False)`: fetch + main-text extraction + link extraction\n"
+    "Recommended order:\n"
+    "1. try `fetch_and_extract(url)` for ordinary pages\n"
+    "2. if text is sparse, selectors are missing, or content is JS-rendered, try `fetch_and_extract(url, use_selenium=True)`\n"
+    "3. use `extract_links(...)` to expand archive/index pages into child pages before shaping final records"
+)
 EDA_NOTEBOOK_IMPORTS = [
+    "IPython",
+    "IPython.display",
     "collections",
     "json",
     "math",
@@ -111,6 +146,7 @@ EDA_NOTEBOOK_IMPORTS = [
     "statistics",
 ]
 NOTEBOOK_ALLOWED_IMPORT_ROOTS = {
+    "IPython",
     "collections",
     "json",
     "math",
@@ -125,6 +161,21 @@ NOTEBOOK_ALLOWED_IMPORT_ROOTS = {
 DEFAULT_SAFE_IMPORTS = sorted(BASE_BUILTIN_MODULES)
 EFFECTIVE_AUTHORIZED_IMPORTS = sorted(set(DEFAULT_SAFE_IMPORTS) | set(AUTHORIZED_IMPORTS))
 EFFECTIVE_EDA_NOTEBOOK_IMPORTS = sorted(set(DEFAULT_SAFE_IMPORTS) | set(EDA_NOTEBOOK_IMPORTS))
+NOTEBOOK_BOOTSTRAP_MARKER = "# data-agent notebook bootstrap"
+NOTEBOOK_BOOTSTRAP_SOURCE = """# data-agent notebook bootstrap
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+try:
+    from IPython.display import display
+except Exception:
+    def display(value):
+        print(value)
+"""
 
 
 @dataclass(slots=True)
@@ -169,6 +220,7 @@ class _SmolagentsDockerBackendBase:
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
+        agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
         *,
         sandbox_key: str = "sandbox",
@@ -177,6 +229,7 @@ class _SmolagentsDockerBackendBase:
         default_port: int = 8888,
     ) -> None:
         self.llm_config = dict(llm_config or {})
+        self.agent_config = dict(agent_config or {})
         self.model = model or self._build_model(self.llm_config)
         self.sandbox_key = sandbox_key
         self.dockerfile_path = dockerfile_path
@@ -234,11 +287,8 @@ class _SmolagentsDockerBackendBase:
         source: Mapping[str, Any],
         sandbox_config: Mapping[str, Any],
     ) -> dict[str, Any]:
-        cpu_limit = float(sandbox_config.get("cpu_limit", 0.5))
         container_run_kwargs = {
-            "mem_limit": str(sandbox_config.get("memory_limit", "512m")),
-            "cpu_quota": int(cpu_limit * 100000),
-            "pids_limit": int(sandbox_config.get("pids_limit", 100)),
+            **self._build_resource_limits(sandbox_config),
             "security_opt": ["no-new-privileges"],
             "cap_drop": ["ALL"],
             "environment": self._build_container_env(),
@@ -246,6 +296,17 @@ class _SmolagentsDockerBackendBase:
         if source.get("allow_network") is False:
             container_run_kwargs["network_disabled"] = True
         return container_run_kwargs
+
+    @staticmethod
+    def _build_resource_limits(sandbox_config: Mapping[str, Any]) -> dict[str, Any]:
+        cpu_limit = float(sandbox_config.get("cpu_limit", DEFAULT_SANDBOX_CPU_LIMIT))
+        return {
+            "mem_limit": str(sandbox_config.get("memory_limit", DEFAULT_SANDBOX_MEMORY_LIMIT)),
+            "cpu_quota": int(cpu_limit * 100000),
+            "pids_limit": int(sandbox_config.get("pids_limit", DEFAULT_SANDBOX_PIDS_LIMIT)),
+            # Chrome and Chromium routinely crash in Docker with the default 64 MB /dev/shm.
+            "shm_size": str(sandbox_config.get("shm_size", DEFAULT_SANDBOX_SHM_SIZE)),
+        }
 
     def _run_agent(
         self,
@@ -313,10 +374,12 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
+        agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
     ) -> None:
         super().__init__(
             llm_config=llm_config,
+            agent_config=agent_config,
             model=model,
             sandbox_key="sandbox",
             dockerfile_path=DOCKERFILE_PATH,
@@ -326,14 +389,28 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
         self.tools = build_search_tools()
         self.instructions = load_skill("data_collection")
 
+    def _build_container_run_kwargs(
+        self,
+        source: Mapping[str, Any],
+        sandbox_config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        container_run_kwargs = super()._build_container_run_kwargs(source, sandbox_config)
+        mount_host_path = str(source.get("mount_host_path") or PROJECT_ROOT)
+        mount_container_path = str(source.get("mount_container_path") or "/workspace")
+        volumes = container_run_kwargs.get("volumes", {})
+        volumes[mount_host_path] = {"bind": mount_container_path, "mode": "ro"}
+        container_run_kwargs["volumes"] = volumes
+        container_run_kwargs["working_dir"] = "/workspace"
+        return container_run_kwargs
+
     def collect(self, source: Mapping[str, Any]) -> SmolagentsCollectionResult:
         source_type = str(source["type"])
-        max_attempts = max(1, int(source.get("max_attempts", 2)))
-        retry_on_empty = bool(source.get("retry_on_empty", source_type == "scrape"))
-        max_steps = max(1, int(source.get("max_steps", 20)))
+        max_attempts = max(1, int(source.get("max_attempts", self.agent_config.get("max_attempts", 2))))
+        retry_on_empty = bool(source.get("retry_on_empty", self.agent_config.get("retry_on_empty", source_type == "scrape")))
+        max_steps = max(1, int(source.get("max_steps", self.agent_config.get("max_steps", 20))))
         logs: list[str] = []
         attempts: list[dict[str, Any]] = []
-        base_task = self._build_task(source)
+        base_task = self._build_task(source, max_steps=max_steps, max_attempts=max_attempts)
 
         for attempt_number in range(1, max_attempts + 1):
             task = self._build_attempt_task(base_task, attempts[-1] if attempts else None)
@@ -383,13 +460,25 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
 
         return SmolagentsCollectionResult(records=[], success=False, logs=logs, attempts=attempts)
 
-    def _build_task(self, source: Mapping[str, Any]) -> str:
+    def _build_task(self, source: Mapping[str, Any], *, max_steps: int, max_attempts: int) -> str:
         source_json = json.dumps(dict(source), indent=2, ensure_ascii=False)
         limit = max(1, int(source.get("limit", 50)))
+        extraction_instructions = str(source.get("extraction_instructions", "")).strip()
+        budget_instruction = (
+            f"You have at most {max_steps} agent steps in this attempt. "
+            "Plan accordingly and return the final answer as soon as you have enough data. "
+            f"The system may retry you up to {max_attempts} attempts total if this attempt fails."
+        )
         research_instruction = (
             "If the extraction pattern is unclear, the site/API is unfamiliar, or an earlier approach fails, "
             "call `github_code_search` to look for existing implementation patterns or prior art and summarize "
             "the useful finding in `notes`. Use `web_search` only if GitHub results are insufficient."
+        )
+        scrape_strategy_instruction = (
+            "For scrape sources, follow this order strictly: "
+            "1) try the provided helper modules first, "
+            "2) if they fail or are clearly insufficient, research with `github_code_search` first and `web_search` second, "
+            "3) only then write custom parsing code, keeping it narrow and source-specific."
         )
         output_instruction = (
             "Return the final answer as a JSON string, not a Python dict repr. "
@@ -404,6 +493,16 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
             "target page, such as a problem statement, post body, article text, or other page-derived content. "
             "Do not use search-result snippets as `text`."
         )
+        scrape_fetch_instruction = (
+            "For ordinary HTML pages, prefer the provided site helper module before writing custom parsing code.\n"
+            f"{SITE_EXTRACTION_HELPER}"
+        )
+        extraction_guidance = (
+            "User extraction instructions:\n"
+            f"{extraction_instructions}\n"
+            if extraction_instructions
+            else ""
+        )
         scrape_decomposition_instruction = (
             "If the target page is an index, listing, archive, or landing page that links to child task documents "
             "(for example PDFs, problem pages, grade-specific pages, or answer sheets), do not stop at cataloging "
@@ -413,7 +512,9 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
             "- acceptable fallback: one record per linked task document with clear metadata such as subject, grade, "
             "asset_type, and asset_url\n"
             "- avoid: one broad summary row for an entire subject or archive page when deeper parsing is possible\n"
-            "When linked PDFs are present, prefer parsing them with `pypdf` or `pdfplumber` if that yields task text. "
+            "When linked PDFs are present, prefer parsing them with `PyMuPDF` (`fitz`) first, then `pdfplumber`, then "
+            "`pdfminer.high_level.extract_text`. Do not invent a brand-new PDF parser if the provided helper is enough.\n"
+            f"{PDF_EXTRACTION_HELPER}\n"
             "Keep parent-child provenance in metadata, such as `parent_url`, `subject`, `grade`, `asset_type`, and "
             "`source_url`."
         )
@@ -422,9 +523,13 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
                 "Collect records from the configured webpage.\n"
                 f"Source configuration:\n{source_json}\n\n"
                 f"Target: extract up to {limit} useful records from this source and return them in the expected output format.\n"
+                f"{extraction_guidance}"
+                f"{budget_instruction}\n"
+                f"{scrape_strategy_instruction}\n"
                 f"{research_instruction}\n"
                 f"{output_instruction}\n"
                 f"{scrape_output_instruction}\n"
+                f"{scrape_fetch_instruction}\n"
                 f"{scrape_decomposition_instruction}"
             )
         if source["type"] == "api":
@@ -432,6 +537,7 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
                 "Collect records from the configured API.\n"
                 f"Source configuration:\n{source_json}\n\n"
                 f"Target: extract up to {limit} useful records from this source and return them in the expected output format.\n"
+                f"{budget_instruction}\n"
                 f"{research_instruction}\n"
                 f"{output_instruction}"
             )
@@ -505,10 +611,12 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
+        agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
     ) -> None:
         super().__init__(
             llm_config=llm_config,
+            agent_config=agent_config,
             model=model,
             sandbox_key="eda_sandbox",
             dockerfile_path=EDA_DOCKERFILE_PATH,
@@ -546,8 +654,8 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
         logs: list[str] = []
         attempts: list[dict[str, Any]] = []
         generation_attempts: list[dict[str, Any]] = []
-        max_attempts = max(1, int(self.llm_config.get("eda_max_attempts", 2)))
-        max_steps = max(1, int(self.llm_config.get("eda_max_steps", 12)))
+        max_attempts = max(1, int(self.agent_config.get("max_attempts", 2)))
+        max_steps = max(1, int(self.agent_config.get("max_steps", 12)))
         inspection = self.inspect_dataset(dataset_path)
         logs.extend(inspection.logs)
         attempts.extend(inspection.attempts)
@@ -560,7 +668,14 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
                 notes=inspection.notes,
             )
 
-        base_task = self._build_task(frame, dataset_path, notebook_path, inspection.summary)
+        base_task = self._build_task(
+            frame,
+            dataset_path,
+            notebook_path,
+            inspection.summary,
+            max_steps=max_steps,
+            max_attempts=max_attempts,
+        )
 
         for attempt_number in range(1, max_attempts + 1):
             task = self._build_attempt_task(base_task, generation_attempts[-1] if generation_attempts else None)
@@ -627,7 +742,7 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
         mount_host_path, mount_container_path, sandbox_dataset_path = self._sandbox_mount(dataset_path)
         logs: list[str] = []
         attempts: list[dict[str, Any]] = []
-        max_attempts = max(1, int(self.llm_config.get("eda_inspection_max_attempts", 1)))
+        max_attempts = max(1, int(self.agent_config.get("inspection_max_attempts", 1)))
 
         for attempt_number in range(1, max_attempts + 1):
             try:
@@ -683,6 +798,9 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
         dataset_path: Path,
         notebook_path: Path,
         inspection_summary: Mapping[str, Any],
+        *,
+        max_steps: int,
+        max_attempts: int,
     ) -> str:
         relative_dataset_path = Path(os.path.relpath(dataset_path, notebook_path.parent)).as_posix()
         preview_json = frame.head(min(3, len(frame))).to_json(orient="records", force_ascii=False, date_format="iso")
@@ -702,6 +820,9 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
             f"Non-null counts: {non_null_json}\n"
             f"Preview rows: {preview_json}\n\n"
             f"Observed dataset inspection summary: {inspection_json}\n\n"
+            f"You have at most {max_steps} agent steps in this notebook-generation attempt. "
+            "Use them to produce the final notebook directly instead of over-exploring. "
+            f"The system may retry you up to {max_attempts} attempts total if this attempt fails.\n"
             "Return the final answer as a JSON string with top-level fields `notebook` and optional `notes`.\n"
             "Call `final_answer(json.dumps(payload, ensure_ascii=False))` exactly once.\n"
             "Do not print the notebook JSON instead of returning it.\n"
@@ -709,11 +830,13 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
             "The notebook must contain at most 10 cells total.\n"
             "Every code cell must be executable later, with `execution_count` set to null and `outputs` set to an empty list.\n"
             f"Notebook code may only import these module roots: {allowed_imports}.\n"
+            "The first code cell must define these aliases so later cells can rely on them: `Path`, `np`, `pd`, `plt`, `sns`, and `display`.\n"
+            "Use this setup pattern in the first code cell: `from pathlib import Path`, `import numpy as np`, `import pandas as pd`, `import matplotlib.pyplot as plt`, `import seaborn as sns`, and a `try/except` import for `display` from `IPython.display`.\n"
             "Use the provided dataset path exactly in notebook code.\n"
             "Use the inspection summary to decide which sections deserve notebook space.\n"
             "Do not use shell escapes like `!pip`.\n"
             "Do not use IPython magics except `%matplotlib inline` if absolutely necessary.\n"
-            "The notebook should include concise markdown sections and executable code for dataset loading, preview, schema summary, null analysis, label distribution when available, text length analysis when available, and top-word analysis when possible.\n"
+            "The notebook should include concise markdown sections and executable code for dataset loading, preview, schema summary, null analysis, label distribution when available, and text-length distributions when text is available.\n"
             "Code must handle missing columns gracefully and must not use shell commands, subprocesses, or arbitrary filesystem writes.\n"
             "Prefer a straightforward 5-7 cell notebook and never exceed 10 cells."
         )
@@ -738,19 +861,9 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
         sandbox_dataset_path = self._sandbox_dataset_path(dataset_path)
         script = f"""
 import json
-import re
 from collections import Counter
 
 import pandas as pd
-
-
-TOKEN_RE = re.compile(r"\\b[a-zA-Z]{{2,}}\\b")
-STOPWORDS = {{
-    "about", "after", "again", "also", "been", "being", "could", "from", "have", "into",
-    "just", "more", "only", "other", "some", "than", "that", "their", "them", "then",
-    "there", "these", "they", "this", "very", "what", "when", "which", "with", "would",
-    "your",
-}}
 
 df = pd.read_json({sandbox_dataset_path!r}, lines=True)
 summary = {{
@@ -779,22 +892,16 @@ if "label" in df.columns and df["label"].notna().any():
 if "text" in df.columns and df["text"].notna().any():
     text_series = df["text"].fillna("").astype(str)
     text_lengths = text_series.str.split().str.len()
-    tokens = Counter(
-        token
-        for text in text_series.head(200)
-        for token in TOKEN_RE.findall(text.lower())
-        if token not in STOPWORDS
-    )
     summary["text_summary"] = {{
-        "word_count_stats": {{
+        "text_length_stats": {{
+            "unit": "words",
             "mean": float(text_lengths.mean()),
             "median": float(text_lengths.median()),
+            "p90": float(text_lengths.quantile(0.9)),
             "max": int(text_lengths.max()),
         }},
-        "top_words": [{{"word": word, "count": count}} for word, count in tokens.most_common(15)],
-        "sample_texts": text_series.head(2).tolist(),
     }}
-    recommended_sections.extend(["text_length", "top_words"])
+    recommended_sections.append("text_length_distribution")
 
 if "source" in df.columns and df["source"].notna().any():
     summary["source_summary"] = df["source"].astype(str).value_counts().head(10).to_dict()
@@ -848,7 +955,6 @@ print(json.dumps(payload, ensure_ascii=False))
             dockerfile_obj = BytesIO(self._load_dockerfile_content().encode("utf-8"))
             client.images.build(fileobj=dockerfile_obj, tag=image_name)
 
-        cpu_limit = float(sandbox_config.get("cpu_limit", 0.5))
         environment = self._build_container_env()
         environment.setdefault("MPLCONFIGDIR", "/tmp/mpl")
 
@@ -860,9 +966,7 @@ print(json.dumps(payload, ensure_ascii=False))
                 working_dir="/workspace",
                 volumes={str(mount_host_path): {"bind": mount_container_path, "mode": "rw"}},
                 environment=environment,
-                mem_limit=str(sandbox_config.get("memory_limit", "512m")),
-                cpu_quota=int(cpu_limit * 100000),
-                pids_limit=int(sandbox_config.get("pids_limit", 100)),
+                **self._build_resource_limits(sandbox_config),
                 security_opt=["no-new-privileges"],
                 cap_drop=["ALL"],
                 network_disabled=bool(sandbox_config.get("disable_network", True)),
@@ -962,6 +1066,8 @@ print(json.dumps(payload, ensure_ascii=False))
                 normalized_cell["outputs"] = []
             normalized_cells.append(normalized_cell)
 
+        normalized_cells = SmolagentsNotebookBackend._ensure_notebook_bootstrap(normalized_cells)
+
         metadata = dict(notebook.get("metadata", {}))
         metadata.setdefault(
             "kernelspec",
@@ -984,6 +1090,35 @@ print(json.dumps(payload, ensure_ascii=False))
             "nbformat": int(notebook.get("nbformat", 4)),
             "nbformat_minor": int(notebook.get("nbformat_minor", 5)),
         }
+
+    @staticmethod
+    def _ensure_notebook_bootstrap(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for cell in cells:
+            if cell.get("cell_type") != "code":
+                continue
+            source = "".join(cell.get("source", [])) if isinstance(cell.get("source"), list) else str(cell.get("source", ""))
+            if NOTEBOOK_BOOTSTRAP_MARKER in source or _defines_required_notebook_aliases(source):
+                return cells
+            bootstrap = NOTEBOOK_BOOTSTRAP_SOURCE.rstrip()
+            combined = f"{bootstrap}\n\n{source.lstrip()}" if source.strip() else bootstrap
+            cell["source"] = _normalize_cell_source(combined)
+            return cells
+
+        if len(cells) >= 10:
+            raise ValueError("Notebook must leave room for a bootstrap code cell with standard imports.")
+
+        insertion_index = 1 if cells and cells[0].get("cell_type") == "markdown" else 0
+        cells.insert(
+            insertion_index,
+            {
+                "cell_type": "code",
+                "metadata": {},
+                "source": _normalize_cell_source(NOTEBOOK_BOOTSTRAP_SOURCE),
+                "execution_count": None,
+                "outputs": [],
+            },
+        )
+        return cells
 
     @staticmethod
     def _validate_notebook(notebook: Mapping[str, Any]) -> None:
@@ -1133,6 +1268,43 @@ def _sanitize_notebook_source(source: str, cell_index: int) -> str:
             raise ValueError(f"Notebook code cell {cell_index} uses unsupported IPython magic '{stripped}'.")
         sanitized_lines.append(line)
     return "\n".join(sanitized_lines)
+
+
+def _defines_required_notebook_aliases(source: str) -> bool:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+
+    def collect_defined_names(statements: list[ast.stmt], defined_names: set[str]) -> None:
+        for node in statements:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        defined_names.add(alias.asname)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined_names.add(alias.asname or alias.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        defined_names.add(target.id)
+            elif isinstance(node, (ast.Try, ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                child_blocks = [node.body, getattr(node, "orelse", []), getattr(node, "finalbody", [])]
+                if isinstance(node, ast.Try):
+                    child_blocks.extend(handler.body for handler in node.handlers)
+                for block in child_blocks:
+                    collect_defined_names(block, defined_names)
+            elif isinstance(node, ast.Match):
+                for case in node.cases:
+                    collect_defined_names(case.body, defined_names)
+
+    defined_names: set[str] = set()
+    collect_defined_names(tree.body, defined_names)
+
+    required_names = {"Path", "display", "np", "pd", "plt", "sns"}
+    return required_names.issubset(defined_names)
 
 
 def _validate_import_root(module_name: str, cell_index: int) -> None:

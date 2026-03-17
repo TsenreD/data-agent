@@ -51,3 +51,30 @@ def test_execute_writes_generated_notebook(tmp_path, monkeypatch) -> None:
 
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     assert notebook["nbformat"] == 4
+
+
+def test_default_notebook_path_uses_output_dir(tmp_path) -> None:
+    output_dir = tmp_path / "data" / "raw"
+    config = {"sources": [], "llm": {}}
+
+    agent = DataCollectionAgent(config=config, output_dir=output_dir)
+
+    assert agent.notebook_path == output_dir / "eda.ipynb"
+
+
+def test_agent_config_is_passed_to_backends() -> None:
+    config = {
+        "sources": [],
+        "llm": {},
+        "agents": {
+            "collection": {"max_steps": 9, "max_attempts": 3},
+            "eda": {"max_steps": 5, "max_attempts": 2, "inspection_max_attempts": 1},
+        },
+    }
+
+    agent = DataCollectionAgent(config=config)
+
+    assert agent.collection_backend.agent_config["max_steps"] == 9
+    assert agent.collection_backend.agent_config["max_attempts"] == 3
+    assert agent.notebook_backend.agent_config["max_steps"] == 5
+    assert agent.notebook_backend.agent_config["max_attempts"] == 2

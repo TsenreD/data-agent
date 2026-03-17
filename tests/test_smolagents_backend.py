@@ -1,3 +1,4 @@
+import agents.data_collection.smolagents_backend as smolagents_backend_module
 from agents.data_collection.smolagents_backend import (
     AUTHORIZED_IMPORTS,
     DEFAULT_SAFE_IMPORTS,
@@ -58,7 +59,15 @@ def test_parse_output_accepts_direct_dict_output() -> None:
 def test_build_task_requires_github_search_before_writing_code() -> None:
     backend = SmolagentsCollectionBackend(model=object())
 
-    task = backend._build_task({"type": "scrape", "url": "https://example.com"})
+    task = backend._build_task(
+        {
+            "type": "scrape",
+            "url": "https://example.com",
+            "extraction_instructions": "Extract one record per problem and preserve source_url.",
+        },
+        max_steps=9,
+        max_attempts=2,
+    )
 
     assert "If the extraction pattern is unclear" in task
     assert "Use `web_search` only if GitHub results are insufficient." in task
@@ -68,6 +77,15 @@ def test_build_task_requires_github_search_before_writing_code() -> None:
     assert "If the target page is an index, listing, archive, or landing page" in task
     assert "do not stop at cataloging those links" in task
     assert "best: one record per actual task/problem" in task
+    assert "You have at most 9 agent steps in this attempt." in task
+    assert "follow this order strictly" in task
+    assert "try the provided helper modules first" in task
+    assert "extract_pdf_text_from_url" in task
+    assert "agents.data_collection.pdf_utils" in task
+    assert "fetch_and_extract(url)" in task
+    assert "agents.data_collection.web_utils" in task
+    assert "User extraction instructions:" in task
+    assert "Extract one record per problem and preserve source_url." in task
 
 
 def test_dockerfile_contains_local_requirements() -> None:
@@ -81,6 +99,8 @@ def test_dockerfile_contains_local_requirements() -> None:
         "markdownify",
         "numpy",
         "pandas",
+        "pdfminer.six",
+        "PyMuPDF",
         "playwright",
         "requests",
         "scrapy",
@@ -128,7 +148,11 @@ def test_all_imports_are_authorized() -> None:
     assert "pathlib" in AUTHORIZED_IMPORTS
     assert "urllib.parse" in AUTHORIZED_IMPORTS
     assert "requests" in AUTHORIZED_IMPORTS
+    assert "agents.data_collection.pdf_utils" in AUTHORIZED_IMPORTS
+    assert "agents.data_collection.web_utils" in AUTHORIZED_IMPORTS
     assert "bs4" in AUTHORIZED_IMPORTS
+    assert "fitz" in AUTHORIZED_IMPORTS
+    assert "pdfminer.high_level" in AUTHORIZED_IMPORTS
     assert "playwright.sync_api" in AUTHORIZED_IMPORTS
     assert "selenium.webdriver.common.by" in AUTHORIZED_IMPORTS
     assert "yaml" in AUTHORIZED_IMPORTS
@@ -155,6 +179,24 @@ def test_backend_registers_search_tools() -> None:
     assert [tool.name for tool in backend.tools] == ["web_search", "github_code_search"]
 
 
+def test_collection_backend_mounts_project_for_pdf_helper() -> None:
+    backend = SmolagentsCollectionBackend(model=object())
+
+    kwargs = backend._build_executor_kwargs({"allow_network": False})
+
+    assert kwargs["container_run_kwargs"]["shm_size"] == "1g"
+    assert kwargs["container_run_kwargs"]["volumes"][str(PROJECT_ROOT)]["bind"] == "/workspace"
+    assert kwargs["container_run_kwargs"]["working_dir"] == "/workspace"
+
+
+def test_collection_backend_allows_overriding_shm_size() -> None:
+    backend = SmolagentsCollectionBackend(model=object(), llm_config={"sandbox": {"shm_size": "2g"}})
+
+    kwargs = backend._build_executor_kwargs({"allow_network": False})
+
+    assert kwargs["container_run_kwargs"]["shm_size"] == "2g"
+
+
 def test_collect_passes_search_tools_to_code_agent(monkeypatch) -> None:
     captured = {}
 
@@ -177,11 +219,8 @@ def test_collect_passes_search_tools_to_code_agent(monkeypatch) -> None:
         def run(self, task, max_steps: int, return_full_result: bool):
             return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
 
-    monkeypatch.setattr(
-        "agents.data_collection.smolagents_backend.PrebakedDockerExecutor",
-        DummyExecutor,
-    )
-    monkeypatch.setattr("agents.data_collection.smolagents_backend.CodeAgent", DummyAgent)
+    monkeypatch.setattr(smolagents_backend_module, "PrebakedDockerExecutor", DummyExecutor)
+    monkeypatch.setattr(smolagents_backend_module, "CodeAgent", DummyAgent)
 
     backend = SmolagentsCollectionBackend(model=object())
     result = backend.collect({"type": "scrape", "url": "https://example.com"})
@@ -213,11 +252,8 @@ def test_collect_defaults_to_twenty_steps_per_attempt(monkeypatch) -> None:
             captured["run_max_steps"] = max_steps
             return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
 
-    monkeypatch.setattr(
-        "agents.data_collection.smolagents_backend.PrebakedDockerExecutor",
-        DummyExecutor,
-    )
-    monkeypatch.setattr("agents.data_collection.smolagents_backend.CodeAgent", DummyAgent)
+    monkeypatch.setattr(smolagents_backend_module, "PrebakedDockerExecutor", DummyExecutor)
+    monkeypatch.setattr(smolagents_backend_module, "CodeAgent", DummyAgent)
 
     backend = SmolagentsCollectionBackend(model=object())
     result = backend.collect({"type": "scrape", "url": "https://example.com"})
@@ -225,6 +261,39 @@ def test_collect_defaults_to_twenty_steps_per_attempt(monkeypatch) -> None:
     assert result.success is True
     assert captured["agent_max_steps"] == 20
     assert captured["run_max_steps"] == 20
+
+
+def test_collect_uses_agent_config_defaults(monkeypatch) -> None:
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class DummyAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            captured["agent_max_steps"] = kwargs["max_steps"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def run(self, task, max_steps: int, return_full_result: bool):
+            captured["run_max_steps"] = max_steps
+            return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
+
+    monkeypatch.setattr(smolagents_backend_module, "PrebakedDockerExecutor", DummyExecutor)
+    monkeypatch.setattr(smolagents_backend_module, "CodeAgent", DummyAgent)
+
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"max_steps": 7})
+    result = backend.collect({"type": "scrape", "url": "https://example.com"})
+
+    assert result.success is True
+    assert captured["agent_max_steps"] == 7
+    assert captured["run_max_steps"] == 7
 
 
 def test_build_container_env_includes_github_token_from_flat_config() -> None:
@@ -247,6 +316,7 @@ def test_build_container_env_includes_github_token_from_nested_config() -> None:
 
 
 def test_notebook_backend_uses_restricted_import_set() -> None:
+    assert "IPython" in EDA_NOTEBOOK_IMPORTS
     assert "pandas" in EDA_NOTEBOOK_IMPORTS
     assert "seaborn" in EDA_NOTEBOOK_IMPORTS
     assert "requests" not in EDA_NOTEBOOK_IMPORTS
@@ -271,4 +341,5 @@ def test_notebook_backend_uses_dedicated_sandbox_defaults() -> None:
 
     assert kwargs["image_name"] == "data-agent-eda-sandbox"
     assert kwargs["port"] == 8890
+    assert kwargs["container_run_kwargs"]["shm_size"] == "1g"
     assert kwargs["container_run_kwargs"]["volumes"][str(PROJECT_ROOT)]["bind"] == "/workspace"

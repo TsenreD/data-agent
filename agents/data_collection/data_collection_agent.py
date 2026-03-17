@@ -30,17 +30,22 @@ class DataCollectionAgent(BaseAgent):
         self,
         config: str | Path | Mapping[str, Any],
         output_dir: str | Path = "data/raw",
-        notebook_path: str | Path = "notebooks/eda.ipynb",
+        notebook_path: str | Path | None = None,
     ) -> None:
         self.config = self._load_config(config)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.notebook_path = Path(notebook_path)
+        self.notebook_path = Path(notebook_path) if notebook_path is not None else self.output_dir / "eda.ipynb"
+        agents_config = self.config.get("agents", {})
+        collection_agent_config = agents_config.get("collection", {}) if isinstance(agents_config, Mapping) else {}
+        eda_agent_config = agents_config.get("eda", {}) if isinstance(agents_config, Mapping) else {}
         self.collection_backend = SmolagentsCollectionBackend(
             llm_config=self.config.get("llm", {}),
+            agent_config=collection_agent_config,
         )
         self.notebook_backend = SmolagentsNotebookBackend(
             llm_config=self.config.get("llm", {}),
+            agent_config=eda_agent_config,
         )
 
     def run(self, sources: Sequence[Mapping[str, Any]] | None = None) -> pd.DataFrame:
