@@ -45,10 +45,12 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["cli"]
+py-modules = ["annotation_agent", "cli"]
 
 [tool.setuptools.packages.find]
 include = ["agents*", "executor*", "models*"]
 
 [tool.setuptools.package-data]
-"agents.data_collection" = ["Dockerfile", "EdaDockerfile", "skills/*/SKILL.md"]
+"agents.data_collection" = ["Dockerfile.parse", "Dockerfile.eda", "skills/*/SKILL.md"]
+"agents.data_annotation" = ["spec.md"]
+"agents.data_quality" = ["skills/*/SKILL.md"]

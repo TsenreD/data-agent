@@ -1,5 +1,5 @@
 project:
-  name: text-sentiment-collection
+  name: math-dataset-collection
   modality: text
 
 # llm:
@@ -8,11 +8,18 @@ project:
 #   base_url: http://localhost:11434/v1/chat/completions
 #   github_token: 
 
+# llm:
+#   provider: openrouter
+#   model: nvidia/nemotron-3-super-120b-a12b:free
+#   base_url: https://openrouter.ai/api/v1/chat/completions
+#   api_key: 
+#   github_token: 
+
 llm:
-  provider: openrouter
-  model: openrouter/hunter-alpha
-  base_url: https://openrouter.ai/api/v1/chat/completions
-  api_key: 
+  provider: local
+  model: /home/jovyan/shares/SR008.fs2/models/MiniMax-M2.5/
+  base_url: http://localhost:8000/v1/chat/completions
+  api_key: emppty
   github_token: 
 
 agents:
@@ -24,6 +31,25 @@ agents:
     max_steps: 5
     max_attempts: 2
     inspection_max_attempts: 1
+  quality:
+    imbalance_threshold: 0.8
+    strategy:
+      missing: median
+      duplicates: drop
+      outliers: clip_iqr
+  annotation:
+    confidence_threshold: 0.75
+    task: answer_annotation
+    base_url: http://localhost:8000/v1/chat/completions
+    prompt: |
+      For rows with no label, try to solve the text problem.
+      If a problem is incomplete (and has no solution), keep label empty,
+      set new field "has_complete_problem" to false, otherwise to true.
+    process_config:
+      parallel_workers: 200
+      timeout_per_row: 120
+      max_retries: 3
+      max_tokens: 8192
 
 
 sources:
@@ -52,7 +78,7 @@ sources:
   #   limit: 200
   #   allow_network: true
 
-  - type: scrape # works semi-well with hunter
+  - type: scrape # works semi-well with hunter (commit: agent 1 v2)
     name: all-russian
     url: https://vos.olimpiada.ru/2025/invite/tasks
     limit: 200

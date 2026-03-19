@@ -1,7 +1,9 @@
 import ast
+from contextlib import contextmanager
 import json
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -22,12 +24,13 @@ from .skillset import load_skill
 
 JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile")
-EDA_DOCKERFILE_PATH = Path(__file__).with_name("EdaDockerfile")
+DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile.parse")
+EDA_DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile.eda")
 DEFAULT_SANDBOX_MEMORY_LIMIT = "512m"
 DEFAULT_SANDBOX_SHM_SIZE = "1g"
 DEFAULT_SANDBOX_CPU_LIMIT = 0.5
 DEFAULT_SANDBOX_PIDS_LIMIT = 100
+LOCALHOST_NO_PROXY = "127.0.0.1,localhost"
 AUTHORIZED_IMPORTS = [
     "aiohttp",
     "agents",
@@ -319,24 +322,35 @@ class _SmolagentsDockerBackendBase:
         source: Mapping[str, Any] | None = None,
     ) -> RunResult:
         logger = AgentLogger(level=LogLevel.ERROR)
-        executor = PrebakedDockerExecutor(
-            additional_imports=additional_imports,
-            logger=logger,
-            **self._build_executor_kwargs(source),
-        )
-        with CodeAgent(
-            tools=tools,
-            model=self.model,
-            executor=executor,
-            executor_type="docker",
-            additional_authorized_imports=additional_imports,
-            max_steps=max_steps,
-            verbosity_level=1,
-            instructions=instructions,
-        ) as agent:
-            run_result = agent.run(task, max_steps=max_steps, return_full_result=True)
+        with _localhost_proxy_bypass():
+            executor_kwargs = self._build_executor_kwargs(source)
+            executor_kwargs["port"] = self._resolve_executor_port(executor_kwargs["port"])
+            executor = PrebakedDockerExecutor(
+                additional_imports=additional_imports,
+                logger=logger,
+                **executor_kwargs,
+            )
+            with CodeAgent(
+                tools=tools,
+                model=self.model,
+                executor=executor,
+                executor_type="docker",
+                additional_authorized_imports=additional_imports,
+                max_steps=max_steps,
+                verbosity_level=1,
+                instructions=instructions,
+            ) as agent:
+                run_result = agent.run(task, max_steps=max_steps, return_full_result=True)
         assert isinstance(run_result, RunResult)
         return run_result
+
+    def _resolve_executor_port(self, desired_port: int) -> int:
+        sandbox_config = dict(self.llm_config.get(self.sandbox_key, {}))
+        if sandbox_config.get("port") is not None:
+            return desired_port
+        if _is_local_port_free("127.0.0.1", desired_port):
+            return desired_port
+        return _find_free_local_port()
 
     @staticmethod
     def _normalize_api_base(api_base: str) -> str:
@@ -1219,6 +1233,47 @@ def _parse_json_payload(raw_output: Any) -> Any:
         except (SyntaxError, ValueError):
             continue
     raise ValueError(f"Agent output is not valid JSON: {text[:500]}")
+
+
+@contextmanager
+def _localhost_proxy_bypass():
+    keys = ("NO_PROXY", "no_proxy")
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ[key] = _merge_no_proxy_values(previous[key], LOCALHOST_NO_PROXY)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _merge_no_proxy_values(existing: str | None, required: str) -> str:
+    values = [item.strip() for item in (existing or "").split(",") if item.strip()]
+    for item in required.split(","):
+        candidate = item.strip()
+        if candidate and candidate not in values:
+            values.append(candidate)
+    return ",".join(values)
+
+
+def _is_local_port_free(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _find_free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _coerce_record(value: Any) -> dict[str, Any]:

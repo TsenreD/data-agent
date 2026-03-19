@@ -14,7 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m pip install --upgrade pip setuptools wheel \
     && python3 -m pip install \
+        ipykernel \
+        ipython \
+        jupyter_client \
+        jupyter_kernel_gateway \
         matplotlib \
         numpy \
         pandas \
         seaborn
+
+EXPOSE 8888
+
+CMD ["jupyter", "kernelgateway", "--KernelGatewayApp.ip=0.0.0.0", "--KernelGatewayApp.port=8888", "--KernelGatewayApp.allow_origin=*"]

@@ -343,3 +343,12 @@ def test_notebook_backend_uses_dedicated_sandbox_defaults() -> None:
     assert kwargs["port"] == 8890
     assert kwargs["container_run_kwargs"]["shm_size"] == "1g"
     assert kwargs["container_run_kwargs"]["volumes"][str(PROJECT_ROOT)]["bind"] == "/workspace"
+
+
+def test_notebook_backend_picks_free_port_when_default_is_busy(monkeypatch) -> None:
+    backend = SmolagentsNotebookBackend(model=object())
+
+    monkeypatch.setattr(smolagents_backend_module, "_is_local_port_free", lambda host, port: False)
+    monkeypatch.setattr(smolagents_backend_module, "_find_free_local_port", lambda: 19090)
+
+    assert backend._resolve_executor_port(8890) == 19090
