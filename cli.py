@@ -5,7 +5,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from agents import DataAnnotationAgent, DataCollectionAgent, DataQualityAgent, PipelineRunner
+from agents import ActiveLearningAgent, DataAnnotationAgent, DataCollectionAgent, DataQualityAgent, PipelineRunner
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,8 +20,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-dir",
-        default="data/raw",
-        help="Directory where collected artifacts will be written.",
+        default="data",
+        help="Base directory where per-agent artifacts will be written.",
     )
     parser.add_argument(
         "--print-head",
@@ -50,23 +50,30 @@ def _agent_enabled(config: Mapping[str, Any], agent_name: str) -> bool:
 def build_runner(config_path: Path, output_dir: Path) -> PipelineRunner:
     config = _load_config(config_path)
     agents = []
-    # if _agent_enabled(config, "collection"):
-    #     agents.append(
-    #         DataCollectionAgent(
-    #             config=config_path,
-    #             output_dir=output_dir,
-    #         )
-    #     )
-    # if _agent_enabled(config, "quality"):
-    #     agents.append(
-    #         DataQualityAgent(
-    #             config=config_path,
-    #             output_dir=output_dir,
-    #         )
-    #     )
+    if _agent_enabled(config, "collection"):
+        agents.append(
+            DataCollectionAgent(
+                config=config_path,
+                output_dir=output_dir,
+            )
+        )
+    if _agent_enabled(config, "quality"):
+        agents.append(
+            DataQualityAgent(
+                config=config_path,
+                output_dir=output_dir,
+            )
+        )
     if _agent_enabled(config, "annotation"):
         agents.append(
             DataAnnotationAgent(
+                config=config_path,
+                output_dir=output_dir,
+            )
+        )
+    if _agent_enabled(config, "active_learning"):
+        agents.append(
+            ActiveLearningAgent(
                 config=config_path,
                 output_dir=output_dir,
             )

@@ -70,12 +70,13 @@ class DataAnnotationAgent(BaseAgent):
     def __init__(
         self,
         config: str | Path | Mapping[str, Any] | None = None,
-        output_dir: str | Path = "data/raw",
+        output_dir: str | Path = "data",
         modality: str | None = None,
         confidence_threshold: float | None = None,
     ) -> None:
         self.config = self._load_config(config)
-        self.output_dir = Path(output_dir)
+        self.base_output_dir = Path(output_dir)
+        self.output_dir = self._stage_output_dir(self.base_output_dir, "annotation")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.annotation_config = self._resolve_annotation_config()
         self.llm_config = self._resolve_llm_config()
@@ -188,10 +189,20 @@ class DataAnnotationAgent(BaseAgent):
     ) -> pd.DataFrame:
         effective_modality = self._resolve_modality(modality)
         annotation_prompt = self._normalize_optional_text(prompt)
-        if annotation_prompt:
-            return self._auto_label_with_prompt(df, effective_modality, annotation_prompt)
+        first_pass = self._single_annotation_pass(df, effective_modality, annotation_prompt)
+        second_pass = self._single_annotation_pass(df, effective_modality, annotation_prompt)
+        return self._combine_annotation_passes(first_pass, second_pass)
+
+    def _single_annotation_pass(
+        self,
+        df: pd.DataFrame,
+        modality: str,
+        prompt: str | None,
+    ) -> pd.DataFrame:
+        if prompt:
+            return self._auto_label_with_prompt(df, modality, prompt)
         working = df.copy()
-        signal_column = self._signal_column(effective_modality)
+        signal_column = self._signal_column(modality)
         if signal_column not in working.columns:
             working[signal_column] = None
         if self.label_column not in working.columns:
@@ -203,7 +214,7 @@ class DataAnnotationAgent(BaseAgent):
             dtype=object,
         )
         if not self._heuristic_labeling_enabled(original_labels):
-            return self._pass_through_annotation(working, effective_modality)
+            return self._pass_through_annotation(working, modality)
         prototypes = self._build_label_prototypes(working, signal_column, original_labels)
         fallback_label = self._fallback_label(prototypes, original_labels)
 
@@ -242,6 +253,94 @@ class DataAnnotationAgent(BaseAgent):
             )
         ]
         return working
+
+    def _combine_annotation_passes(
+        self,
+        first_pass: pd.DataFrame,
+        second_pass: pd.DataFrame,
+    ) -> pd.DataFrame:
+        combined = first_pass.copy()
+        pass_1_labels = pd.Series(
+            [self._normalize_optional_text(value) for value in first_pass.get("annotation_auto_label", pd.Series(index=first_pass.index)).tolist()],
+            index=first_pass.index,
+            dtype=object,
+        )
+        pass_2_labels = pd.Series(
+            [self._normalize_optional_text(value) for value in second_pass.get("annotation_auto_label", pd.Series(index=second_pass.index)).tolist()],
+            index=second_pass.index,
+            dtype=object,
+        )
+        pass_1_conf = pd.to_numeric(first_pass.get("annotation_confidence"), errors="coerce")
+        pass_2_conf = pd.to_numeric(second_pass.get("annotation_confidence"), errors="coerce")
+        pass_1_origin = first_pass.get("annotation_label_origin", pd.Series(index=first_pass.index, dtype=object))
+        pass_2_origin = second_pass.get("annotation_label_origin", pd.Series(index=second_pass.index, dtype=object))
+        references = first_pass.get("annotation_reference_label", pd.Series(index=first_pass.index, dtype=object))
+
+        consensus_labels: list[str | None] = []
+        consensus_confidences: list[float] = []
+        consensus_origins: list[str] = []
+        needs_review: list[bool] = []
+        final_labels: list[str | None] = []
+        intra_agreement: list[bool] = []
+
+        for index in combined.index:
+            reference = self._normalize_optional_text(references.loc[index])
+            label_1 = pass_1_labels.loc[index]
+            label_2 = pass_2_labels.loc[index]
+            complete_1 = self._safe_bool(first_pass.at[index, "has_complete_problem"]) if "has_complete_problem" in first_pass.columns else None
+            complete_2 = self._safe_bool(second_pass.at[index, "has_complete_problem"]) if "has_complete_problem" in second_pass.columns else None
+            agree = label_1 == label_2
+            intra_agreement.append(bool(agree))
+            if agree:
+                consensus_label = label_1
+                conf_values = [value for value in (self._safe_float(pass_1_conf.loc[index]), self._safe_float(pass_2_conf.loc[index])) if value is not None]
+                consensus_confidence = float(sum(conf_values) / len(conf_values)) if conf_values else 0.0
+                origin_1 = self._normalize_optional_text(pass_1_origin.loc[index])
+                origin_2 = self._normalize_optional_text(pass_2_origin.loc[index])
+                consensus_origin = origin_1 if origin_1 == origin_2 and origin_1 is not None else "consensus"
+            else:
+                consensus_label = None
+                consensus_confidence = 0.0
+                consensus_origin = "disagreement"
+
+            final_label = (
+                consensus_label
+                if self.overwrite_existing_labels or reference is None
+                else reference
+            )
+            agreed_incomplete_without_label = (
+                agree
+                and consensus_label is None
+                and complete_1 is False
+                and complete_2 is False
+            )
+            review_required = bool(
+                not agree
+                or consensus_confidence < self.confidence_threshold
+                or (reference is not None and consensus_label is not None and reference != consensus_label)
+                or (final_label is None and reference is None and not agreed_incomplete_without_label)
+            )
+
+            consensus_labels.append(consensus_label)
+            consensus_confidences.append(consensus_confidence)
+            consensus_origins.append(consensus_origin)
+            final_labels.append(final_label)
+            needs_review.append(review_required)
+
+        combined["annotation_auto_label_pass_1"] = pass_1_labels
+        combined["annotation_auto_label_pass_2"] = pass_2_labels
+        combined["annotation_confidence_pass_1"] = pass_1_conf
+        combined["annotation_confidence_pass_2"] = pass_2_conf
+        combined["annotation_label_origin_pass_1"] = pass_1_origin
+        combined["annotation_label_origin_pass_2"] = pass_2_origin
+        combined["annotation_intra_agreement"] = intra_agreement
+        combined["annotation_reference_label"] = references
+        combined["annotation_auto_label"] = consensus_labels
+        combined["annotation_confidence"] = consensus_confidences
+        combined["annotation_label_origin"] = consensus_origins
+        combined[self.label_column] = final_labels
+        combined["annotation_needs_review"] = needs_review
+        return combined
 
     def _pass_through_annotation(self, df: pd.DataFrame, modality: str) -> pd.DataFrame:
         working = df.copy()
@@ -339,8 +438,26 @@ class DataAnnotationAgent(BaseAgent):
         )
         reference = df_labeled.get("annotation_reference_label")
         auto = df_labeled.get("annotation_auto_label")
-        kappa = None
-        agreement = None
+        pass_1 = df_labeled.get("annotation_auto_label_pass_1")
+        pass_2 = df_labeled.get("annotation_auto_label_pass_2")
+        inter_expert_kappa = None
+        inter_expert_agreement = None
+        intra_kappa = None
+        intra_agreement = None
+        if pass_1 is not None and pass_2 is not None:
+            comparable = pd.DataFrame({"pass_1": pass_1, "pass_2": pass_2}).dropna()
+            comparable = comparable[
+                comparable["pass_1"].astype(str).str.strip().ne("")
+                & comparable["pass_2"].astype(str).str.strip().ne("")
+            ]
+            if len(comparable) >= 2:
+                intra_kappa = self._cohen_kappa(
+                    comparable["pass_1"].astype(str).tolist(),
+                    comparable["pass_2"].astype(str).tolist(),
+                )
+                intra_agreement = float(
+                    (comparable["pass_1"].astype(str) == comparable["pass_2"].astype(str)).mean()
+                )
         if reference is not None and auto is not None:
             comparable = pd.DataFrame({"reference": reference, "auto": auto}).dropna()
             comparable = comparable[
@@ -348,11 +465,11 @@ class DataAnnotationAgent(BaseAgent):
                 & comparable["auto"].astype(str).str.strip().ne("")
             ]
             if len(comparable) >= 2:
-                kappa = self._cohen_kappa(
+                inter_expert_kappa = self._cohen_kappa(
                     comparable["reference"].astype(str).tolist(),
                     comparable["auto"].astype(str).tolist(),
                 )
-                agreement = float(
+                inter_expert_agreement = float(
                     (comparable["reference"].astype(str) == comparable["auto"].astype(str)).mean()
                 )
         review_series = df_labeled.get("annotation_needs_review")
@@ -360,9 +477,17 @@ class DataAnnotationAgent(BaseAgent):
             review_series = pd.Series(False, index=df_labeled.index, dtype=bool)
         review_count = int(review_series.fillna(False).sum())
         return {
-            "kappa": kappa,
-            "agreement_pct": None if agreement is None else float(agreement * 100.0),
-            "agreement_rate": agreement,
+            "kappa": inter_expert_kappa,
+            "agreement_pct": None if inter_expert_agreement is None else float(inter_expert_agreement * 100.0),
+            "agreement_rate": inter_expert_agreement,
+            "inter_expert_kappa": inter_expert_kappa,
+            "inter_expert_agreement_pct": None
+            if inter_expert_agreement is None
+            else float(inter_expert_agreement * 100.0),
+            "inter_expert_agreement_rate": inter_expert_agreement,
+            "intra_agreement_kappa": intra_kappa,
+            "intra_agreement_pct": None if intra_agreement is None else float(intra_agreement * 100.0),
+            "intra_agreement_rate": intra_agreement,
             "label_dist": label_dist,
             "confidence_mean": None if valid_confidence.empty else float(valid_confidence.mean()),
             "review_count": review_count,
@@ -398,6 +523,8 @@ class DataAnnotationAgent(BaseAgent):
     ) -> list[dict[str, Any]]:
         effective_threshold = float(threshold if threshold is not None else self.confidence_threshold)
         review_mask = self._confidence_series(df_labeled).fillna(0.0) < effective_threshold
+        if "annotation_intra_agreement" in df_labeled.columns:
+            review_mask = review_mask | ~df_labeled["annotation_intra_agreement"].fillna(False).astype(bool)
         if "annotation_reference_label" in df_labeled.columns and "annotation_auto_label" in df_labeled.columns:
             disagreement_mask = (
                 df_labeled["annotation_reference_label"].notna()
@@ -935,10 +1062,10 @@ class DataAnnotationAgent(BaseAgent):
         input_path = self.annotation_config.get("input_path")
         if input_path:
             return self._read_dataframe(Path(input_path))
-        cleaned_path = self.output_dir / "cleaned_dataset.jsonl"
+        cleaned_path = self._stage_output_dir(self.base_output_dir, "quality") / "cleaned_dataset.jsonl"
         if cleaned_path.exists():
             return self._read_dataframe(cleaned_path)
-        unified_path = self.output_dir / "unified_dataset.jsonl"
+        unified_path = self._stage_output_dir(self.base_output_dir, "collection") / "unified_dataset.jsonl"
         if unified_path.exists():
             return self._read_dataframe(unified_path)
         annotated_path = self.output_dir / "annotated_dataset.jsonl"
@@ -1275,6 +1402,11 @@ class DataAnnotationAgent(BaseAgent):
             self._model_adapter = self._build_model_adapter()
         return self._model_adapter
 
+    def _stage_output_dir(self, output_dir: Path, stage_name: str) -> Path:
+        if output_dir.name == stage_name:
+            return output_dir
+        return output_dir / stage_name
+
     def _build_model_adapter(self) -> BaseModelAdapter:
         return OllamaAdapter(
             model=str(self.process_config.get("model")),
@@ -1333,6 +1465,9 @@ class DataAnnotationAgent(BaseAgent):
         confidence = self._safe_float(row.get("annotation_confidence")) or 0.0
         reference = self._normalize_optional_text(row.get("annotation_reference_label"))
         auto = self._normalize_optional_text(row.get("annotation_auto_label"))
+        intra_agreement = row.get("annotation_intra_agreement")
+        if intra_agreement is False:
+            return "annotation_disagreement"
         if reference is not None and auto is not None and reference != auto:
             return "label_disagreement"
         if confidence < threshold:

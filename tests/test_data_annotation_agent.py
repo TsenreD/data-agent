@@ -249,7 +249,7 @@ class DirectPromptOnlyAdapter:
 
 
 def test_annotation_agent_execute_writes_expected_artifacts(tmp_path) -> None:
-    output_dir = tmp_path / "data" / "raw"
+    output_dir = tmp_path / "data"
     config = {
         "project": {"name": "sentiment-demo", "modality": "text"},
         "agents": {
@@ -275,14 +275,18 @@ def test_annotation_agent_execute_writes_expected_artifacts(tmp_path) -> None:
             "source": ["reviews"] * 4,
         }
     )
-    upstream = AgentResult(dataframe=frame, artifacts={"eda_notebook": str(output_dir / "eda.ipynb")})
+    upstream = AgentResult(dataframe=frame, artifacts={"eda_notebook": str(output_dir / "collection" / "eda.ipynb")})
 
     agent = DataAnnotationAgent(config=config, output_dir=output_dir)
     result = agent.execute(upstream)
 
     assert result.dataframe is not None
-    assert result.dataframe_path == output_dir / "annotated_dataset.jsonl"
+    assert result.dataframe_path == output_dir / "annotation" / "annotated_dataset.jsonl"
     assert result.dataframe["annotation_auto_label"].tolist()[:3] == ["positive", "negative", "positive"]
+    assert "annotation_auto_label_pass_1" in result.dataframe.columns
+    assert "annotation_auto_label_pass_2" in result.dataframe.columns
+    assert "annotation_intra_agreement" in result.dataframe.columns
+    assert result.dataframe["annotation_intra_agreement"].all()
     assert "annotation_confidence" in result.dataframe.columns
     assert Path(result.artifacts["annotation_spec"]).exists()
     assert Path(result.artifacts["annotation_quality"]).exists()
@@ -293,6 +297,7 @@ def test_annotation_agent_execute_writes_expected_artifacts(tmp_path) -> None:
 
     quality_report = json.loads(Path(result.artifacts["annotation_quality"]).read_text(encoding="utf-8"))
     assert quality_report["label_dist"]["negative"] >= 1
+    assert quality_report["intra_agreement_rate"] == 1.0
 
     labelstudio_payload = json.loads(Path(result.artifacts["labelstudio_import"]).read_text(encoding="utf-8"))
     assert labelstudio_payload[0]["annotations"][0]["result"][0]["value"]["choices"] == ["positive"]
@@ -308,9 +313,9 @@ def test_annotation_agent_execute_writes_expected_artifacts(tmp_path) -> None:
 
 def test_annotation_agent_integrates_with_quality_pipeline(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(data_quality_agent_module, "SmolagentsQualityBackend", DummyQualityBackend)
-    output_dir = tmp_path / "data" / "raw"
-    notebook_path = output_dir / "eda.ipynb"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = tmp_path / "data"
+    notebook_path = output_dir / "collection" / "eda.ipynb"
+    notebook_path.parent.mkdir(parents=True, exist_ok=True)
     notebook_path.write_text(
         json.dumps({"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": []}),
         encoding="utf-8",
@@ -336,14 +341,14 @@ def test_annotation_agent_integrates_with_quality_pipeline(monkeypatch, tmp_path
     )
     result = runner.run({"dataframe": frame})
 
-    assert result.dataframe_path == output_dir / "cleaned_dataset.jsonl"
-    assert result.artifacts["annotated_dataset"] == str(output_dir / "annotated_dataset.jsonl")
+    assert result.dataframe_path == output_dir / "quality" / "cleaned_dataset.jsonl"
+    assert result.artifacts["annotated_dataset"] == str(output_dir / "annotation" / "annotated_dataset.jsonl")
     assert Path(result.artifacts["quality_report"]).exists()
     assert result.metadata["annotation"]["quality"]["label_dist"]["positive"] == 1
     assert result.metadata["quality_report"]["missing"]["total"] == 0
 
     backend = runner.agents[1].backend
-    assert backend.detect_calls[0] == output_dir / "annotated_dataset.jsonl"
+    assert backend.detect_calls[0] == output_dir / "annotation" / "annotated_dataset.jsonl"
 
 
 def test_annotation_agent_shim_matches_repo_agent() -> None:
@@ -384,7 +389,7 @@ def test_process_applies_llm_selected_row_transformations(monkeypatch, tmp_path)
 
 
 def test_annotation_prompt_from_config_can_add_new_fields(monkeypatch, tmp_path) -> None:
-    output_dir = tmp_path / "data" / "raw"
+    output_dir = tmp_path / "data"
     frame = pd.DataFrame(
         {
             "text": [
@@ -431,13 +436,50 @@ def test_annotation_prompt_from_config_can_add_new_fields(monkeypatch, tmp_path)
     assert result.dataframe.loc[2, "annotation_label_origin"] == "existing"
 
 
+def test_annotation_quality_reports_inter_expert_and_intra_agreement(tmp_path) -> None:
+    output_dir = tmp_path / "data"
+    frame = pd.DataFrame(
+        {
+            "text": [
+                "great result and clear answer",
+                "bad output and broken flow",
+                "great product and fast response",
+                "awful delay and bad support",
+            ],
+            "label": ["positive", "negative", "positive", "negative"],
+            "source": ["demo"] * 4,
+        }
+    )
+    agent = DataAnnotationAgent(
+        config={
+            "project": {"modality": "text"},
+            "agents": {
+                "annotation": {
+                    "classes": [
+                        {"name": "positive", "keywords": ["great", "fast"]},
+                        {"name": "negative", "keywords": ["bad", "awful", "broken"]},
+                    ]
+                }
+            },
+        },
+        output_dir=output_dir,
+    )
+
+    result = agent.execute({"dataframe": frame})
+
+    assert result.metadata["annotation"]["quality"]["intra_agreement_rate"] == 1.0
+    assert result.metadata["annotation"]["quality"]["inter_expert_agreement_rate"] == 1.0
+    assert result.metadata["annotation"]["quality"]["inter_expert_kappa"] == 1.0
+
+
 def test_annotation_agent_prefers_cleaned_dataset_when_run_after_quality(tmp_path) -> None:
-    output_dir = tmp_path / "data" / "raw"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = tmp_path / "data"
+    (output_dir / "collection").mkdir(parents=True, exist_ok=True)
+    (output_dir / "quality").mkdir(parents=True, exist_ok=True)
     unified = pd.DataFrame({"text": ["raw"], "label": ["before"], "source": ["demo"]})
     cleaned = pd.DataFrame({"text": ["clean"], "label": ["after"], "source": ["demo"]})
-    unified.to_json(output_dir / "unified_dataset.jsonl", orient="records", lines=True)
-    cleaned.to_json(output_dir / "cleaned_dataset.jsonl", orient="records", lines=True)
+    unified.to_json(output_dir / "collection" / "unified_dataset.jsonl", orient="records", lines=True)
+    cleaned.to_json(output_dir / "quality" / "cleaned_dataset.jsonl", orient="records", lines=True)
 
     agent = DataAnnotationAgent(config={"project": {"modality": "text"}}, output_dir=output_dir)
     resolved = agent._resolve_dataframe(None)
@@ -542,7 +584,7 @@ def test_annotation_agent_uses_safe_default_max_tokens(tmp_path) -> None:
 
 
 def test_annotation_prompt_uses_direct_row_transform_path(monkeypatch, tmp_path) -> None:
-    output_dir = tmp_path / "data" / "raw"
+    output_dir = tmp_path / "data"
     frame = pd.DataFrame(
         {
             "text": [

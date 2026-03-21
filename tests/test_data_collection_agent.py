@@ -7,7 +7,7 @@ from agents.data_collection.smolagents_backend import NotebookGenerationResult
 
 
 def test_execute_writes_generated_notebook(tmp_path, monkeypatch) -> None:
-    output_dir = tmp_path / "data" / "raw"
+    output_dir = tmp_path / "data"
     notebook_path = tmp_path / "notebooks" / "eda.ipynb"
     config = {"sources": [{"type": "hf_dataset", "name": "demo"}], "llm": {}}
 
@@ -44,7 +44,7 @@ def test_execute_writes_generated_notebook(tmp_path, monkeypatch) -> None:
 
     result = agent.execute()
 
-    assert result.dataframe_path == output_dir / "unified_dataset.jsonl"
+    assert result.dataframe_path == output_dir / "collection" / "unified_dataset.jsonl"
     assert result.artifacts["eda_notebook"] == str(notebook_path)
     assert result.metadata["eda_notebook_notes"] == ["ok"]
     assert notebook_path.exists()
@@ -54,12 +54,12 @@ def test_execute_writes_generated_notebook(tmp_path, monkeypatch) -> None:
 
 
 def test_default_notebook_path_uses_output_dir(tmp_path) -> None:
-    output_dir = tmp_path / "data" / "raw"
+    output_dir = tmp_path / "data"
     config = {"sources": [], "llm": {}}
 
     agent = DataCollectionAgent(config=config, output_dir=output_dir)
 
-    assert agent.notebook_path == output_dir / "eda.ipynb"
+    assert agent.notebook_path == output_dir / "collection" / "eda.ipynb"
 
 
 def test_agent_config_is_passed_to_backends() -> None:

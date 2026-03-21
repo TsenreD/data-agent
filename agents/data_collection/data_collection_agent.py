@@ -29,11 +29,12 @@ class DataCollectionAgent(BaseAgent):
     def __init__(
         self,
         config: str | Path | Mapping[str, Any],
-        output_dir: str | Path = "data/raw",
+        output_dir: str | Path = "data",
         notebook_path: str | Path | None = None,
     ) -> None:
         self.config = self._load_config(config)
-        self.output_dir = Path(output_dir)
+        self.base_output_dir = Path(output_dir)
+        self.output_dir = self._stage_output_dir(self.base_output_dir, "collection")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.notebook_path = Path(notebook_path) if notebook_path is not None else self.output_dir / "eda.ipynb"
         agents_config = self.config.get("agents", {})
@@ -54,6 +55,11 @@ class DataCollectionAgent(BaseAgent):
         if result.dataframe is None:
             raise RuntimeError("DataCollectionAgent did not produce a dataframe.")
         return result.dataframe
+
+    def _stage_output_dir(self, output_dir: Path, stage_name: str) -> Path:
+        if output_dir.name == stage_name:
+            return output_dir
+        return output_dir / stage_name
 
     def execute(self, payload: Mapping[str, Any] | None = None) -> AgentResult:
         logs: list[str] = []

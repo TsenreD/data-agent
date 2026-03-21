@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -190,9 +191,10 @@ def test_compare_delegates_to_agentic_backend(monkeypatch, tmp_path) -> None:
 
 def test_execute_consumes_upstream_agent_result_and_writes_artifacts(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(data_quality_agent_module, "SmolagentsQualityBackend", DummyQualityBackend)
-    output_dir = tmp_path / "data" / "raw"
-    notebook_path = output_dir / "eda.ipynb"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    output_dir = tmp_path / "data"
+    notebook_path = output_dir / "collection" / "eda.ipynb"
+    notebook_path.parent.mkdir(parents=True, exist_ok=True)
     notebook_path.write_text(
         json.dumps(
             {
@@ -205,7 +207,7 @@ def test_execute_consumes_upstream_agent_result_and_writes_artifacts(monkeypatch
         encoding="utf-8",
     )
     raw_frame = pd.DataFrame({"text": ["alpha"], "label": ["yes"], "score": [10]})
-    raw_path = output_dir / "unified_dataset.jsonl"
+    raw_path = output_dir / "collection" / "unified_dataset.jsonl"
     raw_frame.to_json(raw_path, orient="records", lines=True)
     upstream = AgentResult(
         dataframe=raw_frame,
@@ -220,13 +222,14 @@ def test_execute_consumes_upstream_agent_result_and_writes_artifacts(monkeypatch
     result = agent.execute(upstream)
 
     assert result.dataframe is not None
-    assert result.dataframe_path == output_dir / "cleaned_dataset.jsonl"
+    assert result.dataframe_path == output_dir / "quality" / "cleaned_dataset.jsonl"
     assert Path(result.artifacts["quality_report"]).exists()
     assert Path(result.artifacts["quality_analysis"]).exists()
     assert Path(result.artifacts["quality_comparison"]).exists()
     assert Path(result.artifacts["cleaned_dataset"]).exists()
     assert Path(result.artifacts["eda_notebook"]).exists()
     assert result.metadata["quality_strategy"]["outliers"] == "keep"
+    assert result.metadata["quality_decision"]["mode"] == "automatic"
     assert result.metadata["quality_justification"]
     assert result.metadata["quality_analysis"]["quality_focus"]["irrelevant_checks"] == ["label_distribution"]
     assert result.metadata["quality_analysis"]["quality_focus"]["priority_actions"] == [
@@ -242,15 +245,16 @@ def test_execute_consumes_upstream_agent_result_and_writes_artifacts(monkeypatch
 
 def test_execute_without_payload_uses_saved_unified_dataset(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(data_quality_agent_module, "SmolagentsQualityBackend", DummyQualityBackend)
-    output_dir = tmp_path / "data" / "raw"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    notebook_path = output_dir / "eda.ipynb"
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    output_dir = tmp_path / "data"
+    notebook_path = output_dir / "collection" / "eda.ipynb"
+    notebook_path.parent.mkdir(parents=True, exist_ok=True)
     notebook_path.write_text(
         json.dumps({"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": []}),
         encoding="utf-8",
     )
     raw_frame = pd.DataFrame({"text": ["alpha"], "label": ["yes"], "score": [10]})
-    raw_path = output_dir / "unified_dataset.jsonl"
+    raw_path = output_dir / "collection" / "unified_dataset.jsonl"
     raw_frame.to_json(raw_path, orient="records", lines=True)
 
     agent = DataQualityAgent(config={}, output_dir=output_dir, notebook_path=notebook_path)
@@ -258,3 +262,28 @@ def test_execute_without_payload_uses_saved_unified_dataset(monkeypatch, tmp_pat
 
     assert result.dataframe is not None
     assert agent.backend.detect_calls[0][0] == raw_path
+
+
+def test_execute_prompts_user_to_choose_strategy(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.setattr(data_quality_agent_module, "SmolagentsQualityBackend", DummyQualityBackend)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "2")
+    output_dir = tmp_path / "data"
+    notebook_path = output_dir / "collection" / "eda.ipynb"
+    notebook_path.parent.mkdir(parents=True, exist_ok=True)
+    notebook_path.write_text(
+        json.dumps({"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": []}),
+        encoding="utf-8",
+    )
+    raw_frame = pd.DataFrame({"text": ["alpha"], "label": ["yes"], "score": [10]})
+    raw_path = output_dir / "collection" / "unified_dataset.jsonl"
+    raw_frame.to_json(raw_path, orient="records", lines=True)
+
+    agent = DataQualityAgent(config={}, output_dir=output_dir, notebook_path=notebook_path)
+    result = agent.execute()
+
+    captured = capsys.readouterr()
+    assert "Data Quality Analyzer Suggestions" in captured.out
+    assert result.metadata["quality_decision"]["mode"] == "human_in_the_loop"
+    assert result.metadata["quality_decision"]["selected_option"] == 2
+    assert agent.backend.fix_calls[0][2]["missing"] == "drop"

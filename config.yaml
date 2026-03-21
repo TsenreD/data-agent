@@ -17,9 +17,9 @@ project:
 
 llm:
   provider: local
-  model: /home/jovyan/shares/SR008.fs2/models/MiniMax-M2.5/
+  model: MiniMax-M2.5
   base_url: http://localhost:8000/v1/chat/completions
-  api_key: emppty
+  api_key: empty
   github_token: 
 
 agents:
@@ -56,41 +56,25 @@ sources:
   - type: hf_dataset
     name: MathArena/aime_2026
     split: train
-    limit: 200
+    limit: 50
     column_map:
       text: problem
       label: answer
 
-  # - type: scrape 
-  #   name: usamo_all
-  #   url: https://www.mathschool.com/blog/competitions/usamo-problems-and-solutions
-  #   limit: 200
-  #   allow_network: true
-  #   extraction_instructions: |
-  #     Extract one record per actual olympiad problem, not one record per year page.
-  #     Follow child links when needed.
-  #     Put the full problem statement in `text`.
-  #     Preserve year, round, source_url, and solution_url when available.
+  - type: scrape 
+    name: project-euler
+    url: https://projecteuler.net/archives
+    limit: 50
+    allow_network: true
 
-  # - type: scrape 
-  #   name: project-euler
-  #   url: https://projecteuler.net/archives
-  #   limit: 200
-  #   allow_network: true
-
-  - type: scrape # works semi-well with hunter (commit: agent 1 v2)
+  - type: scrape 
     name: all-russian
     url: https://vos.olimpiada.ru/2025/invite/tasks
-    limit: 200
+    limit: 50
     allow_network: true
     extraction_instructions: |
       Extract one record per actual olympiad problem, not one record per year page.
       Follow child links when needed.
       Put the full problem statement in `text`.
       Preserve year, round, source_url, and solution_url when available.
-  
-  # - type: scrape
-  #   name: aops-all-russian-olympiad
-  #   url: https://artofproblemsolving.com/community/c4299349_2025_allrussian_olympiad
-  #   limit: 200
-  #   allow_network: true
+      Retain only mathematical and physical problems!.

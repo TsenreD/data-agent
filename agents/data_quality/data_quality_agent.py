@@ -34,24 +34,31 @@ class DataQualityAgent(BaseAgent):
     def __init__(
         self,
         config: str | Path | Mapping[str, Any] | None = None,
-        output_dir: str | Path = "data/raw",
+        output_dir: str | Path = "data",
         notebook_path: str | Path | None = None,
     ) -> None:
         self.config = self._load_config(config)
-        self.output_dir = Path(output_dir)
+        self.base_output_dir = Path(output_dir)
+        self.output_dir = self._stage_output_dir(self.base_output_dir, "quality")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.quality_config = self._resolve_quality_config()
         self.default_strategy = self._resolve_default_strategy()
         self.notebook_path = (
             Path(notebook_path)
             if notebook_path is not None
-            else Path(self.quality_config.get("notebook_path", self.output_dir / "eda.ipynb"))
+            else Path(
+                self.quality_config.get(
+                    "notebook_path",
+                    self._stage_output_dir(self.base_output_dir, "collection") / "eda.ipynb",
+                )
+            )
         )
         self.imbalance_threshold = float(
             self.quality_config.get("imbalance_threshold", DEFAULT_IMBALANCE_THRESHOLD)
         )
         self.label_column = self.quality_config.get("label_column")
         self.task_description = str(self.quality_config.get("task_description", "")).strip()
+        self.human_in_the_loop = bool(self.quality_config.get("human_in_the_loop", True))
         self.backend = SmolagentsQualityBackend(
             llm_config=self.config.get("llm", {}),
             agent_config=self.quality_config,
@@ -106,7 +113,10 @@ class DataQualityAgent(BaseAgent):
             label_column=self._normalized_label_column(source_frame),
             preview_frame=source_frame,
         )
-        effective_strategy = self._effective_strategy(explicit_strategy, analysis.analysis or {})
+        effective_strategy, decision_metadata = self._select_strategy_with_user(
+            explicit_strategy=explicit_strategy,
+            analysis=analysis.analysis or {},
+        )
         fix_result = self.backend.fix(
             source_dataset_path,
             cleaned_dataset_path,
@@ -183,6 +193,7 @@ class DataQualityAgent(BaseAgent):
             "quality_analysis": analysis.analysis or {},
             "quality_comparison": comparison_payload,
             "quality_strategy": fix_result.strategy_used or dict(effective_strategy),
+            "quality_decision": decision_metadata,
             "quality_notes": {
                 "detect": detection.notes,
                 "analyze": analysis.notes,
@@ -263,7 +274,10 @@ class DataQualityAgent(BaseAgent):
         input_path = self.quality_config.get("input_path")
         if input_path:
             return self._read_dataframe(Path(input_path))
-        default_input_path = self.output_dir / "unified_dataset.jsonl"
+        annotation_input_path = self._stage_output_dir(self.base_output_dir, "annotation") / "annotated_dataset.jsonl"
+        if annotation_input_path.exists():
+            return self._read_dataframe(annotation_input_path)
+        default_input_path = self._stage_output_dir(self.base_output_dir, "collection") / "unified_dataset.jsonl"
         if default_input_path.exists():
             return self._read_dataframe(default_input_path)
         raise ValueError("DataQualityAgent requires a dataframe payload or quality.input_path.")
@@ -276,10 +290,16 @@ class DataQualityAgent(BaseAgent):
         input_path = self.quality_config.get("input_path")
         if input_path:
             return Path(input_path)
-        default_input_path = self.output_dir / "unified_dataset.jsonl"
+        annotation_input_path = self._stage_output_dir(self.base_output_dir, "annotation") / "annotated_dataset.jsonl"
+        if annotation_input_path.exists():
+            return annotation_input_path
+        default_input_path = self._stage_output_dir(self.base_output_dir, "collection") / "unified_dataset.jsonl"
         if default_input_path.exists():
             return default_input_path
-        return self._stage_dataframe(dataframe, self.output_dir / "unified_dataset.jsonl")
+        return self._stage_dataframe(
+            dataframe,
+            self._stage_output_dir(self.base_output_dir, "collection") / "unified_dataset.jsonl",
+        )
 
     def _resolve_strategy(self, payload: Any | None) -> dict[str, Any]:
         if isinstance(payload, Mapping) and isinstance(payload.get("strategy"), Mapping):
@@ -316,6 +336,82 @@ class DataQualityAgent(BaseAgent):
         if isinstance(recommended, Mapping):
             return self._normalize_strategy(recommended)
         return self._normalize_strategy(explicit_strategy)
+
+    def _select_strategy_with_user(
+        self,
+        *,
+        explicit_strategy: Mapping[str, Any],
+        analysis: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        recommended = self._effective_strategy(explicit_strategy, analysis)
+        alternatives = analysis.get("alternative_strategies")
+        option_strategies: list[dict[str, Any]] = [dict(recommended)]
+        if isinstance(alternatives, list):
+            for candidate in alternatives:
+                if not isinstance(candidate, Mapping):
+                    continue
+                normalized = self._normalize_strategy(candidate)
+                if normalized not in option_strategies:
+                    option_strategies.append(normalized)
+
+        if not self.human_in_the_loop:
+            return recommended, {
+                "mode": "automatic",
+                "selected_option": 1,
+                "selected_strategy": recommended,
+                "reason": "human_in_the_loop disabled",
+            }
+        if not sys.stdin or not sys.stdin.isatty():
+            return recommended, {
+                "mode": "automatic",
+                "selected_option": 1,
+                "selected_strategy": recommended,
+                "reason": "stdin is not interactive",
+            }
+
+        selected_index = self._prompt_user_for_strategy(
+            options=option_strategies,
+            justification=str(analysis.get("justification", "")).strip(),
+            quality_focus=analysis.get("quality_focus"),
+        )
+        selected_strategy = option_strategies[selected_index]
+        return selected_strategy, {
+            "mode": "human_in_the_loop",
+            "selected_option": selected_index + 1,
+            "selected_strategy": selected_strategy,
+            "reason": "selected by user in terminal prompt",
+        }
+
+    def _prompt_user_for_strategy(
+        self,
+        *,
+        options: list[dict[str, Any]],
+        justification: str,
+        quality_focus: Any,
+    ) -> int:
+        print("\nData Quality Analyzer Suggestions")
+        if justification:
+            print(f"Justification: {justification}")
+        if isinstance(quality_focus, Mapping):
+            priority_actions = quality_focus.get("priority_actions")
+            if isinstance(priority_actions, list) and priority_actions:
+                print("Priority actions: " + ", ".join(str(item) for item in priority_actions))
+        for index, strategy in enumerate(options, start=1):
+            label = "recommended" if index == 1 else f"alternative {index - 1}"
+            print(
+                f"{index}. {label}: missing={strategy.get('missing')}, "
+                f"duplicates={strategy.get('duplicates')}, outliers={strategy.get('outliers')}"
+            )
+
+        while True:
+            response = input(f"Select cleaning strategy [1-{len(options)}] (default 1): ").strip()
+            if not response:
+                return 0
+            if response.isdigit():
+                selected = int(response)
+                if 1 <= selected <= len(options):
+                    return selected - 1
+            print("Invalid selection. Enter a listed number.")
 
     def _normalized_label_column(self, dataframe: pd.DataFrame | None = None) -> str | None:
         if isinstance(self.label_column, str) and self.label_column.strip():
@@ -384,6 +480,11 @@ class DataQualityAgent(BaseAgent):
         )
         notebook_path.parent.mkdir(parents=True, exist_ok=True)
         notebook_path.write_text(json.dumps(notebook, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _stage_output_dir(self, output_dir: Path, stage_name: str) -> Path:
+        if output_dir.name == stage_name:
+            return output_dir
+        return output_dir / stage_name
 
     def _load_notebook(self, notebook_path: Path) -> dict[str, Any]:
         if notebook_path.exists():

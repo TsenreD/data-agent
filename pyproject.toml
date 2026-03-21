@@ -28,6 +28,7 @@ dependencies = [
   "seaborn>=0.13",
   "smolagents>=1.24.0",
   "websocket-client>=1.9",
+  "label-studio>=1.23",
 ]
 
 [project.scripts]
@@ -53,4 +54,5 @@ include = ["agents*", "executor*", "models*"]
 [tool.setuptools.package-data]
 "agents.data_collection" = ["Dockerfile.parse", "Dockerfile.eda", "skills/*/SKILL.md"]
 "agents.data_annotation" = ["spec.md"]
+"agents.active_learning" = ["spec.md"]
 "agents.data_quality" = ["skills/*/SKILL.md"]
