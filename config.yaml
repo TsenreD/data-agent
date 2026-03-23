@@ -17,20 +17,34 @@ project:
 
 llm:
   provider: local
-  model: MiniMax-M2.5
+  model: /home/jovyan/shares/SR008.fs2/models/MiniMax-M2.5/
   base_url: http://localhost:8000/v1/chat/completions
   api_key: empty
   github_token: 
+
+  # Docker sandbox resource limits for CodeAgent
+  sandbox:
+    memory_limit: "4g"
+    cpu_limit: 2
+    shm_size: "4g"
+    pids_limit: 200
+
+  eda_sandbox:
+    memory_limit: "4g"
+    cpu_limit: 2
+    shm_size: "4g"
+    pids_limit: 200
 
 agents:
   collection:
     max_steps: 25
     max_attempts: 1
     retry_on_empty: true
+    execution_timeout_seconds: 40
   eda:
-    max_steps: 5
-    max_attempts: 2
-    inspection_max_attempts: 1
+    max_steps: 6
+    max_attempts: 4
+    inspection_max_attempts: 2
   quality:
     imbalance_threshold: 0.8
     strategy:
@@ -38,33 +52,46 @@ agents:
       duplicates: drop
       outliers: clip_iqr
   annotation:
-    confidence_threshold: 0.75
-    task: answer_annotation
     base_url: http://localhost:8000/v1/chat/completions
     prompt: |
-      For rows with no label, try to solve the text problem.
-      If a problem is incomplete (and has no solution), keep label empty,
-      set new field "has_complete_problem" to false, otherwise to true.
+      Solve the text problem, put your answer in \boxed{}.
+      If a problem is incomplete (and has no solution), set label to "invalid".
     process_config:
       parallel_workers: 200
       timeout_per_row: 120
-      max_retries: 3
+      max_retries: 1
       max_tokens: 8192
+  active_learning:
+    task_prompt: |
+      Train classification model to determine whether text contains a full problem, or an incomplete one.
+    target_column: has_complete_problem
+    feature_columns:
+      - text
+    strategy: entropy
+    batch_size: 20
+    test_size: 0.25
+    model:
+      dim: 64
+      bucket_size: 8192
+      min_n: 3
+      max_n: 6
+      learning_rate: 0.05
+      epochs: 25
 
 
 sources:
   - type: hf_dataset
-    name: MathArena/aime_2026
-    split: train
-    limit: 50
+    name: madrylab/gsm8k-platinum
+    split: test
+    limit: 100
     column_map:
-      text: problem
+      text: question
       label: answer
 
   - type: scrape 
     name: project-euler
     url: https://projecteuler.net/archives
-    limit: 50
+    limit: 10
     allow_network: true
 
   - type: scrape 
@@ -77,4 +104,4 @@ sources:
       Follow child links when needed.
       Put the full problem statement in `text`.
       Preserve year, round, source_url, and solution_url when available.
-      Retain only mathematical and physical problems!.
+      Retain only mathematical and physical problems.

@@ -1,12 +1,7 @@
-import os
 import json
 import math
-import re
 import sys
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -15,1085 +10,386 @@ import pandas as pd
 import yaml
 
 from ..base import AgentResult, BaseAgent
-from models import BaseModelAdapter, OllamaAdapter
-
-
-DEFAULT_CONFIDENCE_THRESHOLD = 0.75
-DEFAULT_TASK = "classification"
-SUPPORTED_MODALITIES = {"text", "audio", "image"}
-TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
-DEFAULT_SENTIMENT_KEYWORDS = {
-    "positive": {
-        "good",
-        "great",
-        "excellent",
-        "love",
-        "liked",
-        "amazing",
-        "happy",
-        "best",
-        "fantastic",
-    },
-    "negative": {
-        "bad",
-        "terrible",
-        "awful",
-        "hate",
-        "poor",
-        "worst",
-        "boring",
-        "slow",
-        "broken",
-    },
-    "neutral": {
-        "okay",
-        "average",
-        "normal",
-        "mixed",
-        "fine",
-        "standard",
-        "typical",
-    },
-}
+from .smolagents_backend import SmolagentsAnnotationBackend, SmolagentsParserBackend
 
 
 @dataclass(slots=True)
-class AnnotationArtifacts:
+class AnnotationRunArtifacts:
     annotated_dataset_path: Path
-    spec_path: Path
-    quality_path: Path
-    labelstudio_path: Path
     review_path: Path
+    labelstudio_path: Path
+    quality_path: Path
+    selected_columns_path: Path
+
+
+@dataclass(slots=True)
+class AnnotationPassResult:
+    raw_responses: list[str | None]
+    prompt_payloads: list[dict[str, Any]]
+    logs: list[str] = field(default_factory=list)
 
 
 class DataAnnotationAgent(BaseAgent):
     def __init__(
         self,
-        config: str | Path | Mapping[str, Any] | None = None,
+        config: str | Path | Mapping[str, Any],
         output_dir: str | Path = "data",
-        modality: str | None = None,
-        confidence_threshold: float | None = None,
     ) -> None:
         self.config = self._load_config(config)
         self.base_output_dir = Path(output_dir)
         self.output_dir = self._stage_output_dir(self.base_output_dir, "annotation")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.annotation_config = self._resolve_annotation_config()
-        self.llm_config = self._resolve_llm_config()
-        self.process_config = self._resolve_process_config()
-        self.modality = self._resolve_modality(modality)
-        self.confidence_threshold = float(
-            confidence_threshold
-            if confidence_threshold is not None
-            else self.annotation_config.get("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD)
-        )
-        self.task = str(self.annotation_config.get("task", DEFAULT_TASK)).strip() or DEFAULT_TASK
-        self.label_column = str(self.annotation_config.get("label_column", "label")).strip() or "label"
-        self.overwrite_existing_labels = bool(self.annotation_config.get("overwrite_existing_labels", False))
-        self._model_adapter: BaseModelAdapter | None = None
 
-    def run(
-        self,
-        dataframe: pd.DataFrame,
-        task: str | None = None,
-        annotation_prompt: str | None = None,
-    ) -> pd.DataFrame:
-        result = self.execute(
-            {
-                "dataframe": dataframe,
-                "task": task or self.task,
-                "annotation_prompt": annotation_prompt,
-            }
+        self.annotation_config = self._resolve_annotation_config()
+        self.process_config = self._resolve_process_config()
+
+        self.base_url = str(self.annotation_config["base_url"])
+        self.user_prompt = str(self.annotation_config["prompt"]).strip()
+
+        self.annotation_backend = SmolagentsAnnotationBackend(
+            base_url=self.base_url,
+            model=str(self.process_config.get("model", "default")),
+            timeout=int(self.process_config.get("timeout_per_row", 120)),
+            max_tokens=int(self.process_config.get("max_tokens", 8192)),
+            parallel_workers=int(self.process_config.get("parallel_workers", 200)),
+            max_retries=int(self.process_config.get("max_retries", 1)),
+            api_key=self.process_config.get("api_key"),
+            headers=self.process_config.get("headers"),
         )
+        self.parser_backend = SmolagentsParserBackend(
+            output_dir=self.output_dir,
+            parser_agent_config=self.annotation_config.get("parser_agent", {}),
+            llm_config=self.config.get("llm", {}),
+        )
+
+    def run(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+        result = self.execute({"dataframe": dataframe})
         if result.dataframe is None:
             raise RuntimeError("DataAnnotationAgent did not produce a dataframe.")
         return result.dataframe
+    
+    # TODO:
+    #     (Cohen's κ, label distribution, confidence)
+    #     move from execute function then reuse
+    # def check_quality(df_labeled) → QualityMetrics
+    #   pass
+    
+        
+    # TODO:"JSON in the  LabelStudio import format"
+    #     move from execute function then reuse
+    # def export_to_labelstudio(df)
+    #     pass 
+    
+    def auto_label(self, dataframe: pd.DataFrame, prompt: str | None = None, logs: list | None = None) -> pd.DataFrame:
+        
+        if not prompt:
+            prompt = self.user_prompt
+        
+        # TODO: backend execution, includes prompt from yaml config (check auto_label skill).
+        selected_columns, fewshot_samples = self._select_columns_with_fewshot(dataframe)
+        if logs:
+            self._record_log(f"Selected columns for annotation: {selected_columns}", logs)
+            self._record_log(f"Fewshot samples: {fewshot_samples}", logs)
 
-    def execute(self, payload: Any | None = None) -> AgentResult:
+        work_df = dataframe.copy()
+        work_df["annotation_selected_payload"] = self._build_selected_payloads(work_df, selected_columns)
+
+        pass_1 = self._run_annotation_pass(work_df, pass_name="pass_1", fewshot_samples)
+        pass_2 = self._run_annotation_pass(work_df, pass_name="pass_2", fewshot_samples)
+
+        work_df["annotation_prompt_payload"] = pass_1.prompt_payloads
+        work_df["annotation_raw_response_1"] = pass_1.raw_responses
+        work_df["annotation_raw_response_2"] = pass_2.raw_responses
+        
+        # TODO: save work_df so code agent can read it in it's docker
+
+        parsed_1 = self.parser_backend.parse_answers(
+            df_path=work_df_path,
+            column_name="annotation_raw_response_1",
+        )
+        parsed_2 = self.parser_backend.parse_answers(
+            df_path=work_df_path,
+            column_name="annotation_raw_response_2",
+        )
+
+        work_df["annotation_extracted_answer_1"] = parsed_1["answers"]
+        work_df["annotation_extracted_answer_2"] = parsed_2["answers"]
+        
+        return work_df
+
+    def execute(self, payload: Mapping[str, Any] | None = None) -> AgentResult:
         logs: list[str] = []
         self._record_log("Starting DataAnnotationAgent execution.", logs)
 
-        upstream = payload if isinstance(payload, AgentResult) else None
-        source_frame = self._resolve_dataframe(payload)
-        task = self._resolve_task(payload)
-        annotation_prompt = self._resolve_annotation_prompt(payload)
-        labeled = self.auto_label(source_frame, self.modality, prompt=annotation_prompt)
-        quality_metrics = self.check_quality(labeled)
-        spec_text = self.generate_spec(labeled, task=task)
-        labelstudio_payload = self.export_to_labelstudio(labeled)
-        review_payload = self.flag_for_review(labeled, threshold=self.confidence_threshold)
+        frame = self._resolve_dataframe(payload)
+        self._record_log(f"Loaded dataframe with {len(frame)} rows.", logs)
+
+        work_df = self.auto_label(frame, prompt=self.user_prompt, logs=logs)
+
+        agreement = self._compute_intra_expert_agreement(
+            work_df["annotation_extracted_answer_1"],
+            work_df["annotation_extracted_answer_2"],
+        )
+        work_df["annotation_intra_agreement"] = agreement["per_row_agreement"]
+        work_df["annotation_final_answer"] = agreement["final_answers"]
+        work_df["annotation_needs_review"] = agreement["needs_review"]
+
+        quality = self._build_quality_report(work_df, agreement)
+        review_rows = work_df[work_df["annotation_needs_review"]].copy()
+
+        labelstudio_payload = self._export_to_labelstudio(review_rows, selected_columns)
+
         artifacts = self._write_artifacts(
-            labeled=labeled,
-            spec_text=spec_text,
-            quality_metrics=quality_metrics,
+            labeled=work_df,
+            review_rows=review_rows,
             labelstudio_payload=labelstudio_payload,
-            review_payload=review_payload,
+            quality_metrics=quality,
+            selected_columns=selected_columns,
         )
 
-        self._record_log(f"Wrote annotated dataset to {artifacts.annotated_dataset_path}.", logs)
-        self._record_log(f"Wrote annotation spec to {artifacts.spec_path}.", logs)
-        self._record_log(f"Wrote annotation quality report to {artifacts.quality_path}.", logs)
-        self._record_log(f"Wrote Label Studio import file to {artifacts.labelstudio_path}.", logs)
-        self._record_log(f"Wrote review queue to {artifacts.review_path}.", logs)
+        self._record_log(f"Review queue size: {len(review_rows)}", logs)
         self._record_log("DataAnnotationAgent execution finished successfully.", logs)
 
-        schema = {column: str(dtype) for column, dtype in labeled.dtypes.items()}
-        upstream_artifacts = dict(upstream.artifacts) if upstream is not None else {}
-        upstream_metadata = deepcopy(upstream.metadata) if upstream is not None else {}
-        upstream_logs = list(upstream.logs) if upstream is not None else []
-        upstream_metrics = dict(upstream.metrics) if upstream is not None else {}
-
-        merged_artifacts = {
-            **upstream_artifacts,
-            "annotated_dataset": str(artifacts.annotated_dataset_path),
-            "annotation_spec": str(artifacts.spec_path),
-            "annotation_quality": str(artifacts.quality_path),
-            "labelstudio_import": str(artifacts.labelstudio_path),
-            "low_confidence_review": str(artifacts.review_path),
-        }
-        merged_metadata = {
-            **upstream_metadata,
-            "annotation": {
-                "task": task,
-                "modality": self.modality,
-                "confidence_threshold": self.confidence_threshold,
-                "prompt": annotation_prompt,
-                "quality": quality_metrics,
-                "low_confidence_count": len(review_payload),
-            },
-        }
-        merged_metrics = {
-            **upstream_metrics,
-            "row_count": int(len(labeled)),
-            "annotation_confidence_mean": quality_metrics.get("confidence_mean"),
-            "annotation_kappa": quality_metrics.get("kappa"),
-            "annotation_low_confidence_count": len(review_payload),
-        }
-        merged_logs = self._merge_logs(upstream_logs, logs)
-
         return AgentResult(
-            dataframe=labeled,
+            dataframe=work_df,
             dataframe_path=artifacts.annotated_dataset_path,
-            dataframe_schema=schema,
-            metrics=merged_metrics,
-            artifacts=merged_artifacts,
-            logs=merged_logs,
-            metadata=merged_metadata,
-        )
-
-    def auto_label(
-        self,
-        df: pd.DataFrame,
-        modality: str | None = None,
-        prompt: str | None = None,
-    ) -> pd.DataFrame:
-        effective_modality = self._resolve_modality(modality)
-        annotation_prompt = self._normalize_optional_text(prompt)
-        first_pass = self._single_annotation_pass(df, effective_modality, annotation_prompt)
-        second_pass = self._single_annotation_pass(df, effective_modality, annotation_prompt)
-        return self._combine_annotation_passes(first_pass, second_pass)
-
-    def _single_annotation_pass(
-        self,
-        df: pd.DataFrame,
-        modality: str,
-        prompt: str | None,
-    ) -> pd.DataFrame:
-        if prompt:
-            return self._auto_label_with_prompt(df, modality, prompt)
-        working = df.copy()
-        signal_column = self._signal_column(modality)
-        if signal_column not in working.columns:
-            working[signal_column] = None
-        if self.label_column not in working.columns:
-            working[self.label_column] = None
-
-        original_labels = pd.Series(
-            [self._normalize_optional_text(value) for value in working[self.label_column].tolist()],
-            index=working.index,
-            dtype=object,
-        )
-        if not self._heuristic_labeling_enabled(original_labels):
-            return self._pass_through_annotation(working, modality)
-        prototypes = self._build_label_prototypes(working, signal_column, original_labels)
-        fallback_label = self._fallback_label(prototypes, original_labels)
-
-        auto_labels: list[str | None] = []
-        confidences: list[float] = []
-        for _, row in working.iterrows():
-            label, confidence = self._predict_row_label(
-                row=row,
-                signal_column=signal_column,
-                prototypes=prototypes,
-                fallback_label=fallback_label,
-            )
-            auto_labels.append(label)
-            confidences.append(confidence)
-
-        working["annotation_reference_label"] = original_labels
-        working["annotation_auto_label"] = auto_labels
-        working["annotation_confidence"] = confidences
-        working["annotation_label_origin"] = [
-            "auto" if reference is None else "existing" for reference in original_labels
-        ]
-        final_labels = [
-            auto_label
-            if self.overwrite_existing_labels or reference is None
-            else reference
-            for reference, auto_label in zip(original_labels, auto_labels, strict=False)
-        ]
-        working[self.label_column] = final_labels
-        working["annotation_needs_review"] = [
-            bool(confidence < self.confidence_threshold or (reference and auto_label and reference != auto_label))
-            for reference, auto_label, confidence in zip(
-                original_labels,
-                auto_labels,
-                confidences,
-                strict=False,
-            )
-        ]
-        return working
-
-    def _combine_annotation_passes(
-        self,
-        first_pass: pd.DataFrame,
-        second_pass: pd.DataFrame,
-    ) -> pd.DataFrame:
-        combined = first_pass.copy()
-        pass_1_labels = pd.Series(
-            [self._normalize_optional_text(value) for value in first_pass.get("annotation_auto_label", pd.Series(index=first_pass.index)).tolist()],
-            index=first_pass.index,
-            dtype=object,
-        )
-        pass_2_labels = pd.Series(
-            [self._normalize_optional_text(value) for value in second_pass.get("annotation_auto_label", pd.Series(index=second_pass.index)).tolist()],
-            index=second_pass.index,
-            dtype=object,
-        )
-        pass_1_conf = pd.to_numeric(first_pass.get("annotation_confidence"), errors="coerce")
-        pass_2_conf = pd.to_numeric(second_pass.get("annotation_confidence"), errors="coerce")
-        pass_1_origin = first_pass.get("annotation_label_origin", pd.Series(index=first_pass.index, dtype=object))
-        pass_2_origin = second_pass.get("annotation_label_origin", pd.Series(index=second_pass.index, dtype=object))
-        references = first_pass.get("annotation_reference_label", pd.Series(index=first_pass.index, dtype=object))
-
-        consensus_labels: list[str | None] = []
-        consensus_confidences: list[float] = []
-        consensus_origins: list[str] = []
-        needs_review: list[bool] = []
-        final_labels: list[str | None] = []
-        intra_agreement: list[bool] = []
-
-        for index in combined.index:
-            reference = self._normalize_optional_text(references.loc[index])
-            label_1 = pass_1_labels.loc[index]
-            label_2 = pass_2_labels.loc[index]
-            complete_1 = self._safe_bool(first_pass.at[index, "has_complete_problem"]) if "has_complete_problem" in first_pass.columns else None
-            complete_2 = self._safe_bool(second_pass.at[index, "has_complete_problem"]) if "has_complete_problem" in second_pass.columns else None
-            agree = label_1 == label_2
-            intra_agreement.append(bool(agree))
-            if agree:
-                consensus_label = label_1
-                conf_values = [value for value in (self._safe_float(pass_1_conf.loc[index]), self._safe_float(pass_2_conf.loc[index])) if value is not None]
-                consensus_confidence = float(sum(conf_values) / len(conf_values)) if conf_values else 0.0
-                origin_1 = self._normalize_optional_text(pass_1_origin.loc[index])
-                origin_2 = self._normalize_optional_text(pass_2_origin.loc[index])
-                consensus_origin = origin_1 if origin_1 == origin_2 and origin_1 is not None else "consensus"
-            else:
-                consensus_label = None
-                consensus_confidence = 0.0
-                consensus_origin = "disagreement"
-
-            final_label = (
-                consensus_label
-                if self.overwrite_existing_labels or reference is None
-                else reference
-            )
-            agreed_incomplete_without_label = (
-                agree
-                and consensus_label is None
-                and complete_1 is False
-                and complete_2 is False
-            )
-            review_required = bool(
-                not agree
-                or consensus_confidence < self.confidence_threshold
-                or (reference is not None and consensus_label is not None and reference != consensus_label)
-                or (final_label is None and reference is None and not agreed_incomplete_without_label)
-            )
-
-            consensus_labels.append(consensus_label)
-            consensus_confidences.append(consensus_confidence)
-            consensus_origins.append(consensus_origin)
-            final_labels.append(final_label)
-            needs_review.append(review_required)
-
-        combined["annotation_auto_label_pass_1"] = pass_1_labels
-        combined["annotation_auto_label_pass_2"] = pass_2_labels
-        combined["annotation_confidence_pass_1"] = pass_1_conf
-        combined["annotation_confidence_pass_2"] = pass_2_conf
-        combined["annotation_label_origin_pass_1"] = pass_1_origin
-        combined["annotation_label_origin_pass_2"] = pass_2_origin
-        combined["annotation_intra_agreement"] = intra_agreement
-        combined["annotation_reference_label"] = references
-        combined["annotation_auto_label"] = consensus_labels
-        combined["annotation_confidence"] = consensus_confidences
-        combined["annotation_label_origin"] = consensus_origins
-        combined[self.label_column] = final_labels
-        combined["annotation_needs_review"] = needs_review
-        return combined
-
-    def _pass_through_annotation(self, df: pd.DataFrame, modality: str) -> pd.DataFrame:
-        working = df.copy()
-        signal_column = self._signal_column(modality)
-        if signal_column not in working.columns:
-            working[signal_column] = None
-        if self.label_column not in working.columns:
-            working[self.label_column] = None
-        original_labels = pd.Series(
-            [self._normalize_optional_text(value) for value in working[self.label_column].tolist()],
-            index=working.index,
-            dtype=object,
-        )
-        working["annotation_reference_label"] = original_labels
-        working["annotation_auto_label"] = original_labels
-        working["annotation_confidence"] = [1.0 if label is not None else 0.0 for label in original_labels]
-        working["annotation_label_origin"] = [
-            "existing" if label is not None else "unresolved" for label in original_labels
-        ]
-        working[self.label_column] = original_labels
-        working["annotation_needs_review"] = [label is None for label in original_labels]
-        return working
-
-    def generate_spec(self, df: pd.DataFrame, task: str) -> str:
-        class_defs = self._resolve_class_definitions(df)
-        label_examples = self._label_examples(df, class_defs)
-        ambiguous_examples = self._ambiguous_examples(df)
-        objective = (
-            str(self.annotation_config.get("objective", "")).strip()
-            or f"Assign `{self.label_column}` labels for the `{task}` task."
-        )
-        lines = [
-            "# Annotation Specification\n",
-            "\n",
-            "## Task\n",
-            "\n",
-            f"- Task: `{task}`\n",
-            f"- Objective: {objective}\n",
-            f"- Modality: `{self.modality}`\n",
-            f"- Target column: `{self.label_column}`\n",
-            f"- Human review threshold: `{self.confidence_threshold:.2f}`\n",
-            "\n",
-            "## Classes\n",
-            "\n",
-        ]
-        if not class_defs:
-            lines.append("- No classes were inferred. Samples without usable predictions should be reviewed manually.\n")
-        for class_def in class_defs:
-            name = class_def["name"]
-            description = class_def.get("description") or "No explicit description configured."
-            keywords = ", ".join(class_def.get("keywords", [])) or "none"
-            lines.extend(
-                [
-                    f"### {name}\n",
-                    "\n",
-                    f"- Definition: {description}\n",
-                    f"- Auto-label keywords: {keywords}\n",
-                    "- Examples:\n",
-                ]
-            )
-            for example in label_examples.get(name, []):
-                lines.append(f"  - {example}\n")
-            lines.append("\n")
-
-        lines.extend(
-            [
-                "## Edge Cases\n",
-                "\n",
-                "- Empty or missing modality fields should go to manual review.\n",
-                "- Rows where the existing label disagrees with the auto-label should be reviewed.\n",
-                "- Low-confidence predictions should be exported for human validation.\n",
-                "\n",
-                "## Ambiguous Examples\n",
-                "\n",
-            ]
-        )
-        if ambiguous_examples:
-            for example in ambiguous_examples:
-                lines.append(f"- {example}\n")
-        else:
-            lines.append("- When the content is ambiguous or mixed, send it to manual review instead of forcing a label.\n")
-        return "".join(lines)
-
-    def check_quality(self, df_labeled: pd.DataFrame) -> dict[str, Any]:
-        confidence_series = self._confidence_series(df_labeled)
-        valid_confidence = confidence_series.dropna()
-        label_series = df_labeled.get(self.label_column)
-        label_dist = (
-            {}
-            if label_series is None
-            else {
-                str(label): int(count)
-                for label, count in label_series.dropna().astype(str).value_counts().sort_index().items()
-            }
-        )
-        reference = df_labeled.get("annotation_reference_label")
-        auto = df_labeled.get("annotation_auto_label")
-        pass_1 = df_labeled.get("annotation_auto_label_pass_1")
-        pass_2 = df_labeled.get("annotation_auto_label_pass_2")
-        inter_expert_kappa = None
-        inter_expert_agreement = None
-        intra_kappa = None
-        intra_agreement = None
-        if pass_1 is not None and pass_2 is not None:
-            comparable = pd.DataFrame({"pass_1": pass_1, "pass_2": pass_2}).dropna()
-            comparable = comparable[
-                comparable["pass_1"].astype(str).str.strip().ne("")
-                & comparable["pass_2"].astype(str).str.strip().ne("")
-            ]
-            if len(comparable) >= 2:
-                intra_kappa = self._cohen_kappa(
-                    comparable["pass_1"].astype(str).tolist(),
-                    comparable["pass_2"].astype(str).tolist(),
-                )
-                intra_agreement = float(
-                    (comparable["pass_1"].astype(str) == comparable["pass_2"].astype(str)).mean()
-                )
-        if reference is not None and auto is not None:
-            comparable = pd.DataFrame({"reference": reference, "auto": auto}).dropna()
-            comparable = comparable[
-                comparable["reference"].astype(str).str.strip().ne("")
-                & comparable["auto"].astype(str).str.strip().ne("")
-            ]
-            if len(comparable) >= 2:
-                inter_expert_kappa = self._cohen_kappa(
-                    comparable["reference"].astype(str).tolist(),
-                    comparable["auto"].astype(str).tolist(),
-                )
-                inter_expert_agreement = float(
-                    (comparable["reference"].astype(str) == comparable["auto"].astype(str)).mean()
-                )
-        review_series = df_labeled.get("annotation_needs_review")
-        if review_series is None:
-            review_series = pd.Series(False, index=df_labeled.index, dtype=bool)
-        review_count = int(review_series.fillna(False).sum())
-        return {
-            "kappa": inter_expert_kappa,
-            "agreement_pct": None if inter_expert_agreement is None else float(inter_expert_agreement * 100.0),
-            "agreement_rate": inter_expert_agreement,
-            "inter_expert_kappa": inter_expert_kappa,
-            "inter_expert_agreement_pct": None
-            if inter_expert_agreement is None
-            else float(inter_expert_agreement * 100.0),
-            "inter_expert_agreement_rate": inter_expert_agreement,
-            "intra_agreement_kappa": intra_kappa,
-            "intra_agreement_pct": None if intra_agreement is None else float(intra_agreement * 100.0),
-            "intra_agreement_rate": intra_agreement,
-            "label_dist": label_dist,
-            "confidence_mean": None if valid_confidence.empty else float(valid_confidence.mean()),
-            "review_count": review_count,
-            "review_rate": 0.0 if len(df_labeled) == 0 else float(review_count / len(df_labeled)),
-        }
-
-    def export_to_labelstudio(self, df: pd.DataFrame) -> list[dict[str, Any]]:
-        signal_column = self._signal_column(self.modality)
-        tasks: list[dict[str, Any]] = []
-        for index, row in df.reset_index(drop=True).iterrows():
-            signal_value = row.get(signal_column)
-            if self._is_empty(signal_value):
-                continue
-            task: dict[str, Any] = {
-                "id": int(index + 1),
-                "data": {signal_column: signal_value},
-                "meta": {
-                    "source": row.get("source"),
-                    "confidence": self._safe_float(row.get("annotation_confidence")),
-                    "needs_review": bool(row.get("annotation_needs_review", False)),
-                },
-            }
-            annotation = self._labelstudio_annotation(row, signal_column)
-            if annotation is not None:
-                task["annotations"] = [annotation]
-            tasks.append(task)
-        return tasks
-
-    def flag_for_review(
-        self,
-        df_labeled: pd.DataFrame,
-        threshold: float | None = None,
-    ) -> list[dict[str, Any]]:
-        effective_threshold = float(threshold if threshold is not None else self.confidence_threshold)
-        review_mask = self._confidence_series(df_labeled).fillna(0.0) < effective_threshold
-        if "annotation_intra_agreement" in df_labeled.columns:
-            review_mask = review_mask | ~df_labeled["annotation_intra_agreement"].fillna(False).astype(bool)
-        if "annotation_reference_label" in df_labeled.columns and "annotation_auto_label" in df_labeled.columns:
-            disagreement_mask = (
-                df_labeled["annotation_reference_label"].notna()
-                & df_labeled["annotation_auto_label"].notna()
-                & df_labeled["annotation_reference_label"].astype(str).ne(
-                    df_labeled["annotation_auto_label"].astype(str)
-                )
-            )
-            review_mask = review_mask | disagreement_mask
-
-        review_rows = df_labeled[review_mask].copy()
-
-        tasks = self.export_to_labelstudio(review_rows)
-        for task, (_, row) in zip(tasks, review_rows.iterrows(), strict=False):
-            task["meta"]["review_reason"] = self._review_reason(row, effective_threshold)
-        return tasks
-
-    def process(self, df_path: str | Path, prompt: str) -> Path:
-        source_path = Path(df_path)
-        frame = self._read_dataframe(source_path)
-        processed, _ = self._process_frame(frame, prompt=prompt)
-        if processed.equals(frame):
-            output_path = source_path.with_name(f"{source_path.stem}_processed.csv")
-            frame.to_csv(output_path, index=False)
-            return output_path
-
-        output_path = source_path.with_name(f"{source_path.stem}_processed.csv")
-        processed.to_csv(output_path, index=False)
-        return output_path
-
-    def _auto_label_with_prompt(
-        self,
-        df: pd.DataFrame,
-        modality: str,
-        prompt: str,
-    ) -> pd.DataFrame:
-        working = df.copy()
-        signal_column = self._signal_column(modality)
-        if signal_column not in working.columns:
-            working[signal_column] = None
-        if self.label_column not in working.columns:
-            working[self.label_column] = None
-
-        original_labels = pd.Series(
-            [self._normalize_optional_text(value) for value in working[self.label_column].tolist()],
-            index=working.index,
-            dtype=object,
-        )
-        candidate_mask = pd.Series(True, index=working.index, dtype=bool)
-        if not self.overwrite_existing_labels:
-            candidate_mask = original_labels.isna()
-
-        processed = working.copy()
-        processed_mask = pd.Series(False, index=working.index, dtype=bool)
-        filtered = working.loc[candidate_mask].copy()
-        if not filtered.empty:
-            row_prompt = self._build_annotation_row_prompt(prompt)
-            transformed, successful_indices = self._transform_rows(
-                filtered,
-                row_prompt,
-                json_schema=self._annotation_result_schema(prompt),
-            )
-            allowed_columns = set(working.columns) | self._allowed_prompt_output_columns(prompt)
-            transformed = transformed[[column for column in transformed.columns if column in allowed_columns]]
-            for column in transformed.columns:
-                if column not in processed.columns:
-                    processed[column] = None
-                elif processed[column].dtype != object:
-                    processed[column] = processed[column].astype(object)
-            processed.loc[transformed.index, transformed.columns] = transformed
-            processed_mask.loc[successful_indices] = True
-        if self.label_column not in processed.columns:
-            processed[self.label_column] = original_labels
-
-        prompt_auto_column = processed["annotation_auto_label"] if "annotation_auto_label" in processed.columns else None
-        prompt_confidence_column = (
-            pd.to_numeric(processed["annotation_confidence"], errors="coerce")
-            if "annotation_confidence" in processed.columns
-            else pd.Series(index=processed.index, dtype=float)
-        )
-
-        auto_labels: list[str | None] = []
-        confidences: list[float] = []
-        label_origins: list[str] = []
-        final_labels: list[str | None] = []
-        needs_review: list[bool] = []
-
-        for index in processed.index:
-            reference = original_labels.loc[index]
-            current_label = self._normalize_optional_text(processed.at[index, self.label_column])
-            prompt_auto = None if prompt_auto_column is None else self._normalize_optional_text(prompt_auto_column.loc[index])
-            has_complete_problem = self._safe_bool(processed.at[index, "has_complete_problem"]) if "has_complete_problem" in processed.columns else None
-            if has_complete_problem is False:
-                current_label = None
-                prompt_auto = None
-            auto_label = prompt_auto or current_label or reference
-            confidence = self._safe_float(prompt_confidence_column.loc[index])
-            if confidence is None:
-                if processed_mask.loc[index]:
-                    confidence = 1.0 if auto_label is not None or has_complete_problem is False else 0.0
-                else:
-                    confidence = 1.0 if reference is not None else 0.0
-            if processed_mask.loc[index]:
-                label_origin = "prompt"
-            elif reference is not None:
-                label_origin = "existing"
-            else:
-                label_origin = "unresolved"
-            final_label = current_label if current_label is not None else reference
-            incomplete_without_label = final_label is None and has_complete_problem is False
-
-            auto_labels.append(auto_label)
-            confidences.append(float(confidence))
-            label_origins.append(label_origin)
-            final_labels.append(final_label)
-            needs_review.append(
-                bool(
-                    (final_label is None and not incomplete_without_label)
-                    or confidence < self.confidence_threshold
-                    or (reference is not None and auto_label is not None and reference != auto_label)
-                )
-            )
-
-        processed["annotation_reference_label"] = original_labels
-        processed["annotation_auto_label"] = auto_labels
-        processed["annotation_confidence"] = confidences
-        processed["annotation_label_origin"] = label_origins
-        processed[self.label_column] = final_labels
-        processed["annotation_needs_review"] = needs_review
-        return processed
-
-    def _build_annotation_row_prompt(self, prompt: str) -> str:
-        lines = [
-            "You are annotating dataset rows represented as JSON objects.",
-            f"User task: {prompt.strip()}",
-            f"Target label column: `{self.label_column}`.",
-            "Return only a JSON object for the same row.",
-            "Preserve all original keys unless you are explicitly adding a new field required by the task.",
-            "Do not include explanations, markdown, or chain-of-thought.",
-            "If you cannot determine a valid label because the problem is incomplete or missing required context, leave the label empty instead of guessing.",
-            "If a row refers to a missing passage, dialogue, audio, image, table, or 'the text' without including that material in the row itself, treat the problem as incomplete.",
-            f"If `{self.label_column}` is empty, do not place explanations or reasoning in `{self.label_column}`.",
-        ]
-        if "has_complete_problem" in prompt:
-            lines.append(
-                "When the task asks for `has_complete_problem`, set it to false for incomplete/unsolved rows and true otherwise."
-            )
-            lines.append(
-                f"If `has_complete_problem` is true, `{self.label_column}` must contain the concrete answer. "
-                f"If you cannot provide the answer, set `{self.label_column}` to null and `has_complete_problem` to false."
-            )
-        return "\n".join(lines)
-
-    def _annotation_result_schema(self, prompt: str) -> dict[str, Any]:
-        properties: dict[str, Any] = {
-            self.label_column: {
-                "type": ["string", "number", "boolean", "null"],
-            }
-        }
-        required = [self.label_column]
-        if "has_complete_problem" in prompt:
-            properties["has_complete_problem"] = {"type": ["boolean", "null"]}
-            required.append("has_complete_problem")
-        return {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": True,
-        }
-
-    def _batch_transform_schema(self, row_schema: Mapping[str, Any] | None) -> dict[str, Any]:
-        item_schema = dict(row_schema or {"type": "object"})
-        properties = dict(item_schema.get("properties", {}))
-        properties["_process_row_index"] = {"type": "string"}
-        required = list(item_schema.get("required", []))
-        if "_process_row_index" not in required:
-            required.append("_process_row_index")
-        return {
-            "type": "object",
-            "properties": {
-                "rows": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                        "additionalProperties": True,
-                    },
+            dataframe_schema={column: str(dtype) for column, dtype in work_df.dtypes.items()},
+            metrics={
+                "row_count": int(len(work_df)),
+                "review_count": int(len(review_rows)),
+                "intra_agreement_rate": quality["intra_agreement_rate"],
+                "intra_agreement_pct": quality["intra_agreement_pct"],
+            },
+            artifacts={
+                "annotated_dataset": str(artifacts.annotated_dataset_path),
+                "review_rows": str(artifacts.review_path),
+                "labelstudio_export": str(artifacts.labelstudio_path),
+                "quality_report": str(artifacts.quality_path),
+                "selected_columns": str(artifacts.selected_columns_path),
+            },
+            logs=logs + pass_1.logs + pass_2.logs,
+            metadata={
+                "annotation": {
+                    "task": self.task,
+                    "confidence_threshold": self.confidence_threshold,
+                    "selected_columns": selected_columns,
                 }
             },
-            "required": ["rows"],
-            "additionalProperties": False,
-        }
-
-    def _allowed_prompt_output_columns(self, prompt: str) -> set[str]:
-        allowed = {
-            self.label_column,
-            "annotation_confidence",
-        }
-        allowed.update(self._prompt_declared_fields(prompt))
-        return allowed
-
-    def _prompt_declared_fields(self, prompt: str) -> set[str]:
-        fields: set[str] = set()
-        for match in re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"', prompt):
-            fields.add(match)
-        for match in re.findall(r"'([A-Za-z_][A-Za-z0-9_]*)'", prompt):
-            fields.add(match)
-        return fields
-
-    def _process_frame(
-        self,
-        frame: pd.DataFrame,
-        *,
-        prompt: str,
-        candidate_mask: pd.Series | None = None,
-    ) -> tuple[pd.DataFrame, pd.Series]:
-        working = frame.copy()
-        effective_mask = (
-            pd.Series(True, index=working.index, dtype=bool)
-            if candidate_mask is None
-            else candidate_mask.reindex(working.index, fill_value=False).astype(bool)
         )
-        eligible = working.loc[effective_mask].copy()
-        processed_mask = pd.Series(False, index=working.index, dtype=bool)
-        if eligible.empty:
-            return working, processed_mask
 
-        selected = self._select_rows_for_process(eligible, prompt)
-        filtered = eligible.iloc[selected["row_positions"]].copy()
-        if filtered.empty:
-            return working, processed_mask
-
-        row_prompt = self._build_row_prompt(filtered, prompt)
-        transformed, successful_indices = self._transform_rows(filtered, row_prompt)
-        for column in transformed.columns:
-            if column not in working.columns:
-                working[column] = None
-            elif working[column].dtype != object:
-                working[column] = working[column].astype(object)
-        working.loc[transformed.index, transformed.columns] = transformed
-        processed_mask.loc[successful_indices] = True
-        return working, processed_mask
-
-    def _select_rows_for_process(self, frame: pd.DataFrame, prompt: str) -> dict[str, Any]:
-        sample_size = int(self.process_config.get("sample_size", 8))
-        sample_rows = []
-        for row_position, (_, row) in enumerate(frame.head(sample_size).iterrows()):
-            payload = self._json_ready(row.to_dict())
-            payload["_row_position"] = row_position
-            sample_rows.append(payload)
-
-        selection = self._chat_json(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You select which DataFrame rows should be transformed. "
-                        "Prefer a reusable pandas-style boolean expression in `filter_condition` "
-                        "when possible. Use explicit `row_indices` only when the match is exceptional."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "prompt": prompt,
-                            "schema": list(frame.columns),
-                            "sample_rows": sample_rows,
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            json_schema={
-                "type": "object",
-                "properties": {
-                    "filter_condition": {"type": ["string", "null"]},
-                    "row_indices": {"type": "array", "items": {"type": "integer"}},
-                },
-                "required": ["filter_condition", "row_indices"],
-                "additionalProperties": False,
-            },
+    def _select_columns_with_fewshot(self, df: pd.DataFrame) -> list[str]:
+        sample_rows = df.head(min(8, len(df))).to_dict(orient="records")
+        columns, fewshot_samples = self.annotation_backend.select_columns_with_fewshot(
+            user_prompt=self.user_prompt,
+            columns=[str(c) for c in df.columns],
+            sample_rows=sample_rows,
         )
-        return {
-            "filter_condition": selection.get("filter_condition"),
-            "row_positions": self._apply_process_selection(frame, selection),
-        }
+        selected = [c for c in columns if c in df.columns]
 
-    def _build_row_prompt(self, filtered: pd.DataFrame, prompt: str) -> str:
-        response = self._chat_json(
-            messages=[
+        if not selected:
+            selected = [c for c in ["text", "problem", "question", "prompt"] if c in df.columns]
+        if not selected:
+            selected = list(df.columns)
+
+        return selected, fewshot_samples
+
+    def _build_selected_payloads(self, df: pd.DataFrame, selected_columns: Sequence[str]) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for _, row in df.iterrows():
+            payload = {}
+            for col in selected_columns:
+                payload[col] = self._json_ready(row.get(col))
+            payloads.append(payload)
+        return payloads
+
+    def _run_annotation_pass(self, df: pd.DataFrame, pass_name: str, fewshot_samples) -> AnnotationPassResult:
+        logs: list[str] = []
+        self._record_log(f"Starting annotation {pass_name}.", logs)
+
+        prompts = []
+        for row_payload in df["annotation_selected_payload"].tolist():
+            prompts.append(
                 {
-                    "role": "system",
-                    "content": (
-                        "Rewrite the user request into a deterministic instruction for a single JSON row. "
-                        "The instruction must preserve unchanged keys unless the user explicitly asks otherwise."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "user_prompt": prompt,
-                            "sample_filtered_row": self._json_ready(filtered.iloc[0].to_dict()),
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            json_schema={
-                "type": "object",
-                "properties": {"row_prompt": {"type": "string"}},
-                "required": ["row_prompt"],
-                "additionalProperties": False,
-            },
-        )
-        row_prompt = str(response.get("row_prompt", "")).strip()
-        if not row_prompt:
-            raise ValueError("Row transformation prompt generation returned an empty prompt.")
-        return row_prompt
-
-    def _transform_rows(
-        self,
-        filtered: pd.DataFrame,
-        row_prompt: str,
-        json_schema: Mapping[str, Any] | None = None,
-    ) -> tuple[pd.DataFrame, list[Any]]:
-        if filtered.empty:
-            return filtered.copy(), []
-        parallel_workers = self._effective_parallel_workers()
-        batch_size = self._effective_batch_size()
-        transformed_rows: dict[Any, dict[str, Any]] = {}
-        successful_indices: list[Any] = []
-        batches = [
-            filtered.iloc[start : start + batch_size].copy()
-            for start in range(0, len(filtered), batch_size)
-        ]
-        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-            future_to_batch = {
-                executor.submit(self._transform_row_batch, batch, row_prompt, json_schema): tuple(batch.index.tolist())
-                for batch in batches
-            }
-            for future in as_completed(future_to_batch):
-                batch_rows, batch_successes = future.result()
-                transformed_rows.update(batch_rows)
-                successful_indices.extend(batch_successes)
-        transformed = pd.DataFrame.from_dict(transformed_rows, orient="index")
-        transformed = transformed.reindex(filtered.index)
-        if "_process_row_index" in transformed.columns:
-            transformed = transformed.drop(columns=["_process_row_index"])
-        return transformed, successful_indices
-
-    def _transform_row_batch(
-        self,
-        batch: pd.DataFrame,
-        row_prompt: str,
-        json_schema: Mapping[str, Any] | None = None,
-    ) -> tuple[dict[Any, dict[str, Any]], list[Any]]:
-        original_rows = {index: dict(row.to_dict()) for index, row in batch.iterrows()}
-        if len(batch) == 1:
-            index = next(iter(original_rows))
-            transformed_row, success = self._transform_single_row(index, original_rows[index], row_prompt, json_schema)
-            return {index: transformed_row}, [index] if success else []
-
-        timeout_per_row = int(self.process_config.get("timeout_per_row", self.llm_config.get("timeout", 60)))
-        batch_timeout = max(timeout_per_row, timeout_per_row * len(batch))
-        row_id_map = {str(position): index for position, index in enumerate(batch.index.tolist())}
-        payload_rows = []
-        for row_id, index in row_id_map.items():
-            row_payload = self._json_ready(original_rows[index])
-            row_payload["_process_row_index"] = row_id
-            payload_rows.append(row_payload)
-        try:
-            response = self._chat_json(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            f"{row_prompt}\n"
-                            "Return only a JSON object with a `rows` array. Each item must include "
-                            "`_process_row_index` copied from the input row. Preserve all original keys unless "
-                            "you are explicitly adding a new field. Do not change `id` if it exists."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps({"rows": payload_rows}, ensure_ascii=False),
-                    },
-                ],
-                json_schema=self._batch_transform_schema(json_schema),
-                timeout=batch_timeout,
+                    "user_prompt": self.user_prompt,
+                    "fewshot_samples": fewshot_samples,
+                    "subset_of_cols": row_payload,
+                }
             )
-            transformed_rows = dict(original_rows)
-            successful_indices: list[Any] = []
-            for transformed_row in response.get("rows", []):
-                if not isinstance(transformed_row, Mapping):
-                    continue
-                row_id = str(transformed_row.get("_process_row_index", "")).strip()
-                if row_id not in row_id_map:
-                    continue
-                index = row_id_map[row_id]
-                normalized_row = dict(transformed_row)
-                normalized_row.pop("_process_row_index", None)
-                transformed_rows[index] = self._normalize_transformed_row(original_rows[index], normalized_row)
-                successful_indices.append(index)
-            return transformed_rows, successful_indices
-        except Exception:
-            transformed_rows = dict(original_rows)
-            successful_indices: list[Any] = []
-            for index, original_row in original_rows.items():
-                transformed_row, success = self._transform_single_row(index, original_row, row_prompt, json_schema)
-                transformed_rows[index] = transformed_row
-                if success:
-                    successful_indices.append(index)
-            return transformed_rows, successful_indices
 
-    def _transform_single_row(
-        self,
-        index: Any,
-        row_payload: Mapping[str, Any],
-        row_prompt: str,
-        json_schema: Mapping[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], bool]:
-        max_retries = max(1, int(self.process_config.get("max_retries", 3)))
-        timeout_per_row = int(self.process_config.get("timeout_per_row", self.llm_config.get("timeout", 60)))
-        original_row = dict(row_payload)
-        json_ready_row = self._json_ready(original_row)
-        last_error: Exception | None = None
-        for _ in range(max_retries):
-            try:
-                response = self._chat_json(
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                f"{row_prompt}\n"
-                                "Return only a JSON object. Preserve all original keys unless you are explicitly "
-                                "adding a new field. Do not change `id` if it exists."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": json.dumps(json_ready_row, ensure_ascii=False),
-                        },
-                    ],
-                    json_schema=json_schema or {"type": "object"},
-                    timeout=timeout_per_row,
-                )
-                return self._normalize_transformed_row(original_row, response), True
-            except Exception as error:
-                last_error = error
-        if last_error is not None:
-            self._record_log(
-                f"Process transform retries exhausted for row {index}: {type(last_error).__name__}: {last_error}"
+        raw_responses = self.annotation_backend.annotate_batch(prompts)
+        self._record_log(f"Finished annotation {pass_name}.", logs)
+
+        return AnnotationPassResult(
+            raw_responses=raw_responses,
+            prompt_payloads=prompts,
+            logs=logs,
+        )
+
+    def _generate_parser_code(self, df: pd.DataFrame) -> str:
+        samples = []
+        for _, row in df.head(min(40, len(df))).iterrows():
+            samples.append(
+                {
+                    "raw_response_1": row.get("annotation_raw_response_1"),
+                    "raw_response_2": row.get("annotation_raw_response_2"),
+                }
             )
-        return original_row, False
+        return self.parser_backend.generate_parser_code(
+            task_prompt=self.user_prompt,
+            samples=samples,
+            parser_spec=(
+                "Write a Python parser with function extract_answer(text: str | None) -> str | None. "
+                "It should extract the answer inside \\boxed{} when present. "
+                "If output indicates incomplete problem or invalid task, return 'invalid'. "
+                "Normalize whitespace. Return None on truly unparseable content."
+            ),
+        )
 
-    def _apply_process_selection(self, frame: pd.DataFrame, selection: Mapping[str, Any]) -> list[int]:
-        raw_positions = selection.get("row_indices") or []
-        if isinstance(raw_positions, Sequence) and not isinstance(raw_positions, (str, bytes)):
-            valid_positions = []
-            for value in raw_positions:
-                try:
-                    position = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= position < len(frame):
-                    valid_positions.append(position)
-            if valid_positions:
-                return sorted(dict.fromkeys(valid_positions))
-
-        filter_condition = str(selection.get("filter_condition") or "").strip()
-        if not filter_condition:
-            return []
-        try:
-            mask = frame.eval(filter_condition, engine="python")
-            if isinstance(mask, pd.Series):
-                return [int(position) for position, include in enumerate(mask.fillna(False).tolist()) if bool(include)]
-        except Exception:
-            pass
-        try:
-            queried = frame.query(filter_condition, engine="python")
-            return [int(frame.index.get_loc(index)) for index in queried.index]
-        except Exception as error:
-            raise ValueError(f"Unable to apply LLM filter_condition {filter_condition!r}: {error}") from error
-
-    def _normalize_transformed_row(
+    def _compute_intra_expert_agreement(
         self,
-        original_row: Mapping[str, Any],
-        transformed_row: Mapping[str, Any],
+        answers_1: pd.Series,
+        answers_2: pd.Series,
     ) -> dict[str, Any]:
-        if not isinstance(transformed_row, Mapping):
-            raise ValueError("Row transformation did not return a JSON object.")
-        normalized = dict(original_row)
-        normalized.update(dict(transformed_row))
-        if "id" in original_row and normalized.get("id") != original_row.get("id"):
-            raise ValueError("Row transformation changed the immutable `id` field.")
-        for key in original_row:
-            if key not in normalized:
-                raise ValueError(f"Row transformation dropped required key {key!r}.")
-        return normalized
+        norm_1 = answers_1.apply(self._normalize_answer)
+        norm_2 = answers_2.apply(self._normalize_answer)
 
-    def _json_ready(self, value: Any) -> Any:
-        if self._is_empty(value):
+        per_row = []
+        final_answers = []
+        needs_review = []
+
+        for a1, a2 in zip(norm_1.tolist(), norm_2.tolist(), strict=False):
+            agree = a1 == a2 and a1 is not None
+            per_row.append(bool(agree))
+            final_answers.append(a1 if agree else None)
+            needs_review.append(not agree)
+
+        comparable = pd.DataFrame({"a1": norm_1, "a2": norm_2}).dropna()
+        agreement_rate = None
+        kappa = None
+        if len(comparable) >= 2:
+            agreement_rate = float((comparable["a1"] == comparable["a2"]).mean())
+            kappa = self._cohen_kappa(
+                comparable["a1"].astype(str).tolist(),
+                comparable["a2"].astype(str).tolist(),
+            )
+
+        return {
+            "per_row_agreement": per_row,
+            "final_answers": final_answers,
+            "needs_review": needs_review,
+            "agreement_rate": agreement_rate,
+            "kappa": kappa,
+        }
+
+    def _build_quality_report(self, df: pd.DataFrame, agreement: Mapping[str, Any]) -> dict[str, Any]:
+        review_count = int(df["annotation_needs_review"].fillna(False).sum())
+        return {
+            "row_count": int(len(df)),
+            "review_count": review_count,
+            "review_rate": 0.0 if len(df) == 0 else float(review_count / len(df)),
+            "intra_agreement_rate": agreement["agreement_rate"],
+            "intra_agreement_pct": None if agreement["agreement_rate"] is None else float(agreement["agreement_rate"] * 100.0),
+            "intra_agreement_kappa": agreement["kappa"],
+        }
+
+    def _export_to_labelstudio(
+        self,
+        df: pd.DataFrame,
+        selected_columns: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        tasks: list[dict[str, Any]] = []
+        for i, (_, row) in enumerate(df.iterrows(), start=1):
+            data = {col: self._json_ready(row.get(col)) for col in selected_columns}
+            data["annotation_raw_response_1"] = row.get("annotation_raw_response_1")
+            data["annotation_raw_response_2"] = row.get("annotation_raw_response_2")
+            data["annotation_extracted_answer_1"] = row.get("annotation_extracted_answer_1")
+            data["annotation_extracted_answer_2"] = row.get("annotation_extracted_answer_2")
+
+            tasks.append(
+                {
+                    "id": i,
+                    "data": data,
+                    "meta": {
+                        "needs_review": True,
+                        "reason": self._review_reason(row),
+                    },
+                }
+            )
+        return tasks
+
+    def _review_reason(self, row: pd.Series) -> str:
+        a1 = self._normalize_answer(row.get("annotation_extracted_answer_1"))
+        a2 = self._normalize_answer(row.get("annotation_extracted_answer_2"))
+        if a1 is None or a2 is None:
+            return "parser_failed_or_empty_answer"
+        if a1 != a2:
+            return "pass_disagreement"
+        return "unknown"
+
+    def _write_artifacts(
+        self,
+        *,
+        labeled: pd.DataFrame,
+        review_rows: pd.DataFrame,
+        labelstudio_payload: Sequence[Mapping[str, Any]],
+        quality_metrics: Mapping[str, Any],
+        selected_columns: Sequence[str],
+    ) -> AnnotationRunArtifacts:
+        annotated_dataset_path = self.output_dir / "annotated_dataset.jsonl"
+        review_path = self.output_dir / "review_rows.jsonl"
+        labelstudio_path = self.output_dir / "labelstudio_review.json"
+        quality_path = self.output_dir / "annotation_quality.json"
+        selected_columns_path = self.output_dir / "selected_columns.json"
+
+        labeled.to_json(annotated_dataset_path, orient="records", lines=True, force_ascii=False)
+        review_rows.to_json(review_path, orient="records", lines=True, force_ascii=False)
+        labelstudio_path.write_text(json.dumps(list(labelstudio_payload), indent=2, ensure_ascii=False), encoding="utf-8")
+
+        quality_path.write_text(json.dumps(dict(quality_metrics), indent=2, ensure_ascii=False), encoding="utf-8")
+        selected_columns_path.write_text(json.dumps(list(selected_columns), indent=2, ensure_ascii=False), encoding="utf-8")
+
+        return AnnotationRunArtifacts(
+            annotated_dataset_path=annotated_dataset_path,
+            review_path=review_path,
+            labelstudio_path=labelstudio_path,
+            quality_path=quality_path,
+            selected_columns_path=selected_columns_path,
+        )
+
+    def _normalize_answer(self, value: Any) -> str | None:
+        if value is None:
             return None
-        if isinstance(value, Mapping):
-            return {str(key): self._json_ready(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            return [self._json_ready(item) for item in value]
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, (datetime, pd.Timestamp)):
-            return value.isoformat()
-        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
-            try:
-                return self._json_ready(value.item())
-            except Exception:
-                return str(value)
-        return value
+        text = str(value).strip()
+        if not text:
+            return None
+        return " ".join(text.split())
 
-    def _resolve_dataframe(self, payload: Any | None) -> pd.DataFrame:
-        if isinstance(payload, AgentResult):
-            if payload.dataframe is not None:
-                return payload.dataframe.copy()
-            if payload.dataframe_path is not None:
-                return self._read_dataframe(Path(payload.dataframe_path))
-        if isinstance(payload, pd.DataFrame):
-            return payload.copy()
-        if isinstance(payload, Mapping):
-            if isinstance(payload.get("dataframe"), pd.DataFrame):
-                return payload["dataframe"].copy()
-            if payload.get("dataframe_path"):
-                return self._read_dataframe(Path(payload["dataframe_path"]))
+    def _cohen_kappa(self, reference: Sequence[str], predicted: Sequence[str]) -> float | None:
+        if len(reference) != len(predicted) or len(reference) < 2:
+            return None
+        labels = sorted(set(reference) | set(predicted))
+        observed = sum(1 for ref, pred in zip(reference, predicted, strict=False) if ref == pred) / len(reference)
+
+        ref_counts = {label: reference.count(label) for label in labels}
+        pred_counts = {label: predicted.count(label) for label in labels}
+
+        expected = 0.0
+        for label in labels:
+            expected += (ref_counts[label] / len(reference)) * (pred_counts[label] / len(predicted))
+
+        if math.isclose(1.0 - expected, 0.0):
+            return 1.0 if math.isclose(observed, 1.0) else 0.0
+        return float((observed - expected) / (1.0 - expected))
+
+    def _resolve_dataframe(self, payload: Mapping[str, Any] | None) -> pd.DataFrame:
+        if payload and isinstance(payload.get("dataframe"), pd.DataFrame):
+            return payload["dataframe"].copy()
+
         input_path = self.annotation_config.get("input_path")
         if input_path:
             return self._read_dataframe(Path(input_path))
-        cleaned_path = self._stage_output_dir(self.base_output_dir, "quality") / "cleaned_dataset.jsonl"
-        if cleaned_path.exists():
-            return self._read_dataframe(cleaned_path)
-        unified_path = self._stage_output_dir(self.base_output_dir, "collection") / "unified_dataset.jsonl"
-        if unified_path.exists():
-            return self._read_dataframe(unified_path)
-        annotated_path = self.output_dir / "annotated_dataset.jsonl"
-        if annotated_path.exists():
-            return self._read_dataframe(annotated_path)
-        raise ValueError("DataAnnotationAgent requires a dataframe payload or annotation.input_path.")
 
-    def _resolve_task(self, payload: Any | None) -> str:
-        if isinstance(payload, Mapping) and isinstance(payload.get("task"), str) and payload.get("task", "").strip():
-            return str(payload["task"]).strip()
-        configured_task = str(self.annotation_config.get("task", "")).strip()
-        if configured_task:
-            return configured_task
-        project_name = str(self.config.get("project", {}).get("name", "")).strip()
-        if project_name:
-            return project_name
-        return DEFAULT_TASK
-
-    def _resolve_annotation_prompt(self, payload: Any | None) -> str | None:
-        if isinstance(payload, Mapping):
-            prompt = self._normalize_optional_text(payload.get("annotation_prompt"))
-            if prompt:
-                return prompt
-        for key in ("annotation_prompt", "prompt", "instructions"):
-            prompt = self._normalize_optional_text(self.annotation_config.get(key))
-            if prompt:
-                return prompt
-        return None
+        raise ValueError("DataAnnotationAgent requires payload['dataframe'] or annotation.input_path.")
 
     def _resolve_annotation_config(self) -> dict[str, Any]:
         agents_config = self.config.get("agents", {})
@@ -1104,467 +400,46 @@ class DataAnnotationAgent(BaseAgent):
             return dict(annotation_config)
         return {}
 
-    def _resolve_llm_config(self) -> dict[str, Any]:
-        llm_config = self.config.get("llm", {})
-        if isinstance(llm_config, Mapping):
-            return dict(llm_config)
-        return {}
-
     def _resolve_process_config(self) -> dict[str, Any]:
-        configured = self.annotation_config.get("process_config", self.annotation_config.get("process", {}))
+        configured = self.annotation_config.get("process_config", {})
         if not isinstance(configured, Mapping):
             configured = {}
         merged = {
             "parallel_workers": 200,
-            "remote_parallel_workers": 2,
-            "batch_size": configured.get("batch_size"),
-            "remote_batch_size": 4,
+            "timeout_per_row": 120,
+            "max_retries": 1,
             "max_tokens": 8192,
-            "timeout_per_row": 10,
-            "max_retries": 3,
-            "sample_size": 8,
-            "model": configured.get("model")
-            or self.annotation_config.get("model")
-            or self.llm_config.get("model")
-            or "gpt-4o-mini",
-            "base_url": configured.get("base_url")
-            or self.annotation_config.get("base_url")
-            or configured.get("api_base")
-            or self.annotation_config.get("api_base")
-            or self.llm_config.get("base_url")
-            or self.llm_config.get("api_base")
-            or "http://localhost:11434/v1/chat/completions",
-            "api_key": configured.get("api_key")
-            or self.annotation_config.get("api_key")
-            or self.llm_config.get("api_key")
-            or os.getenv("OPENAI_API_KEY")
-            or "ollama",
-            "headers": configured.get("headers")
-            or self.annotation_config.get("headers")
-            or self.llm_config.get("headers")
-            or {},
-            "timeout": configured.get("timeout")
-            or self.annotation_config.get("timeout")
-            or self.llm_config.get("timeout", 60),
+            "model": configured.get("model", "default"),
+            "api_key": configured.get("api_key"),
+            "headers": configured.get("headers", {}),
         }
         merged.update(dict(configured))
         return merged
 
-    def _resolve_modality(self, modality: str | None) -> str:
-        candidate = modality or self.annotation_config.get("modality") or self.config.get("project", {}).get("modality")
-        normalized = str(candidate or "text").strip().lower()
-        if normalized not in SUPPORTED_MODALITIES:
-            raise ValueError(f"Unsupported annotation modality '{normalized}'.")
-        return normalized
-
-    def _signal_column(self, modality: str) -> str:
-        column_name = self.annotation_config.get(f"{modality}_column")
-        if isinstance(column_name, str) and column_name.strip():
-            return column_name.strip()
-        return modality
-
-    def _build_label_prototypes(
-        self,
-        frame: pd.DataFrame,
-        signal_column: str,
-        labels: pd.Series,
-    ) -> dict[str, Counter[str]]:
-        prototypes: dict[str, Counter[str]] = {}
-        for class_def in self._resolve_class_definitions(frame):
-            seed = Counter(self._tokenize(class_def.get("description", "")))
-            seed.update(self._tokenize(" ".join(class_def.get("keywords", []))))
-            seed.update(self._tokenize(" ".join(class_def.get("examples", []))))
-            if class_def["name"].lower() in DEFAULT_SENTIMENT_KEYWORDS:
-                seed.update(DEFAULT_SENTIMENT_KEYWORDS[class_def["name"].lower()])
-            prototypes[class_def["name"]] = seed
-
-        if signal_column in frame.columns:
-            for label in labels.dropna().astype(str).tolist():
-                if label not in prototypes:
-                    prototypes[label] = Counter()
-            for idx, label in labels.items():
-                normalized_label = self._normalize_optional_text(label)
-                if normalized_label is None:
-                    continue
-                row = frame.loc[idx]
-                prototypes[normalized_label].update(self._row_tokens(row.get(signal_column), row.get("metadata")))
-        return prototypes
-
-    def _resolve_class_definitions(self, frame: pd.DataFrame) -> list[dict[str, Any]]:
-        configured = self.annotation_config.get("classes") or self.annotation_config.get("labels") or []
-        definitions: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        if isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
-            for item in configured:
-                class_def = self._normalize_class_definition(item)
-                if class_def is None or class_def["name"] in seen:
-                    continue
-                definitions.append(class_def)
-                seen.add(class_def["name"])
-
-        if self.label_column in frame.columns:
-            for label in frame[self.label_column].dropna().astype(str):
-                normalized = label.strip()
-                if not normalized or normalized in seen:
-                    continue
-                definitions.append(
-                    {
-                        "name": normalized,
-                        "description": "",
-                        "keywords": [],
-                        "examples": [],
-                    }
-                )
-                seen.add(normalized)
-        return definitions
-
-    def _normalize_class_definition(self, item: Any) -> dict[str, Any] | None:
-        if isinstance(item, str):
-            name = item.strip()
-            if not name:
-                return None
-            return {"name": name, "description": "", "keywords": [], "examples": []}
-        if not isinstance(item, Mapping):
-            return None
-        name = str(item.get("name") or item.get("label") or "").strip()
-        if not name:
-            return None
-        keywords = [str(value).strip() for value in item.get("keywords", []) if str(value).strip()]
-        examples = [str(value).strip() for value in item.get("examples", []) if str(value).strip()]
-        description = str(item.get("description", "")).strip()
-        return {
-            "name": name,
-            "description": description,
-            "keywords": keywords,
-            "examples": examples,
-        }
-
-    def _fallback_label(self, prototypes: Mapping[str, Counter[str]], labels: pd.Series) -> str | None:
-        if not labels.dropna().empty:
-            counts = labels.dropna().astype(str).value_counts()
-            if not counts.empty:
-                return str(counts.index[0])
-        if prototypes:
-            return next(iter(prototypes))
-        return None
-
-    def _heuristic_labeling_enabled(self, labels: pd.Series) -> bool:
-        observed = [str(label).strip() for label in labels.dropna().tolist() if str(label).strip()]
-        if not observed:
-            return True
-        unique_count = len(set(observed))
-        observed_count = len(observed)
-        numeric_count = sum(1 for label in observed if self._is_numeric_like(label))
-        numeric_ratio = numeric_count / observed_count
-        unique_ratio = unique_count / observed_count
-        if numeric_ratio >= 0.8 and unique_ratio >= 0.5:
-            return False
-        if unique_count >= 20 and unique_ratio >= 0.4:
-            return False
-        return True
-
-    def _is_numeric_like(self, value: str) -> bool:
-        try:
-            float(value)
-        except (TypeError, ValueError):
-            return False
-        return True
-
-    def _predict_row_label(
-        self,
-        *,
-        row: pd.Series,
-        signal_column: str,
-        prototypes: Mapping[str, Counter[str]],
-        fallback_label: str | None,
-    ) -> tuple[str | None, float]:
-        tokens = self._row_tokens(row.get(signal_column), row.get("metadata"))
-        if not tokens:
-            return fallback_label, 0.0
-        scores: dict[str, float] = {}
-        token_counts = Counter(tokens)
-        for label, prototype in prototypes.items():
-            if not prototype:
-                continue
-            overlap = 0.0
-            for token, count in token_counts.items():
-                overlap += count * float(prototype.get(token, 0))
-            if label.lower() in DEFAULT_SENTIMENT_KEYWORDS:
-                overlap += float(sum(1 for token in tokens if token in DEFAULT_SENTIMENT_KEYWORDS[label.lower()]))
-            if overlap > 0:
-                scores[label] = overlap
-
-        if not scores:
-            return fallback_label, 0.0 if fallback_label is None else 0.34
-
-        best_label, best_score = max(scores.items(), key=lambda item: item[1])
-        total_score = sum(scores.values())
-        confidence = 1.0 if total_score <= 0 else min(1.0, float(best_score / total_score))
-        return best_label, confidence
-
-    def _label_examples(
-        self,
-        frame: pd.DataFrame,
-        class_defs: Sequence[Mapping[str, Any]],
-    ) -> dict[str, list[str]]:
-        signal_column = self._signal_column(self.modality)
-        examples: dict[str, list[str]] = {
-            str(class_def["name"]): [str(example).strip() for example in class_def.get("examples", []) if str(example).strip()]
-            for class_def in class_defs
-        }
-        if signal_column not in frame.columns or self.label_column not in frame.columns:
-            return examples
-        for _, row in frame[[signal_column, self.label_column]].dropna().iterrows():
-            label = str(row[self.label_column]).strip()
-            signal = str(row[signal_column]).strip()
-            if not label or not signal:
-                continue
-            examples.setdefault(label, [])
-            if signal[:160] not in examples[label]:
-                examples[label].append(signal[:160])
-        for label, entries in examples.items():
-            while len(entries) < 3:
-                if entries:
-                    entries.append(entries[len(entries) % len(entries)])
-                else:
-                    entries.append(f"No confirmed example available yet for `{label}`.")
-        return examples
-
-    def _ambiguous_examples(self, frame: pd.DataFrame) -> list[str]:
-        signal_column = self._signal_column(self.modality)
-        examples: list[str] = []
-        if signal_column not in frame.columns:
-            return examples
-        review_mask = self._confidence_series(frame).fillna(1.0) < self.confidence_threshold
-        if "annotation_reference_label" in frame.columns and "annotation_auto_label" in frame.columns:
-            review_mask = review_mask | (
-                frame["annotation_reference_label"].fillna("").astype(str).str.strip()
-                != frame["annotation_auto_label"].fillna("").astype(str).str.strip()
-            )
-        for value in frame.loc[review_mask, signal_column].dropna().astype(str):
-            trimmed = value.strip()
-            if not trimmed:
-                continue
-            examples.append(trimmed[:180])
-            if len(examples) == 3:
-                break
-        return examples
-
-    def _write_artifacts(
-        self,
-        *,
-        labeled: pd.DataFrame,
-        spec_text: str,
-        quality_metrics: Mapping[str, Any],
-        labelstudio_payload: Sequence[Mapping[str, Any]],
-        review_payload: Sequence[Mapping[str, Any]],
-    ) -> AnnotationArtifacts:
-        annotated_dataset_path = self.output_dir / "annotated_dataset.jsonl"
-        spec_path = self.output_dir / "annotation_spec.md"
-        quality_path = self.output_dir / "annotation_quality.json"
-        labelstudio_path = self.output_dir / "labelstudio_import.json"
-        review_path = self.output_dir / "low_confidence_review.json"
-        labeled.to_json(annotated_dataset_path, orient="records", lines=True, force_ascii=False, date_format="iso")
-        spec_path.write_text(spec_text, encoding="utf-8")
-        quality_path.write_text(json.dumps(quality_metrics, indent=2, ensure_ascii=False), encoding="utf-8")
-        labelstudio_path.write_text(json.dumps(list(labelstudio_payload), indent=2, ensure_ascii=False), encoding="utf-8")
-        review_path.write_text(json.dumps(list(review_payload), indent=2, ensure_ascii=False), encoding="utf-8")
-        return AnnotationArtifacts(
-            annotated_dataset_path=annotated_dataset_path,
-            spec_path=spec_path,
-            quality_path=quality_path,
-            labelstudio_path=labelstudio_path,
-            review_path=review_path,
-        )
-
-    def _labelstudio_annotation(self, row: pd.Series, signal_column: str) -> dict[str, Any] | None:
-        label = self._normalize_optional_text(row.get(self.label_column))
-        if label is None:
-            return None
-        return {
-            "id": f"annotation-{row.name}",
-            "completed_by": "data_annotation_agent",
-            "was_cancelled": False,
-            "ground_truth": False,
-            "result": [
-                {
-                    "from_name": "label",
-                    "to_name": signal_column,
-                    "type": "choices",
-                    "value": {"choices": [label]},
-                }
-            ],
-            "lead_time": 0.0,
-        }
-
-    def _adapter(self) -> BaseModelAdapter:
-        if self._model_adapter is None:
-            self._model_adapter = self._build_model_adapter()
-        return self._model_adapter
-
-    def _stage_output_dir(self, output_dir: Path, stage_name: str) -> Path:
-        if output_dir.name == stage_name:
-            return output_dir
-        return output_dir / stage_name
-
-    def _build_model_adapter(self) -> BaseModelAdapter:
-        return OllamaAdapter(
-            model=str(self.process_config.get("model")),
-            base_url=str(self.process_config.get("base_url")),
-            api_key=str(self.process_config.get("api_key", "")) or None,
-            timeout=int(self.process_config.get("timeout", 60)),
-            max_tokens=None if self.process_config.get("max_tokens") is None else int(self.process_config.get("max_tokens")),
-            headers=self.process_config.get("headers"),
-            max_retries=int(self.process_config.get("request_max_retries", 5)),
-            retry_backoff_seconds=float(self.process_config.get("retry_backoff_seconds", 1.0)),
-            retry_backoff_max_seconds=float(self.process_config.get("retry_backoff_max_seconds", 30.0)),
-        )
-
-    def _chat_json(
-        self,
-        *,
-        messages: Sequence[Mapping[str, str]],
-        json_schema: Mapping[str, Any],
-        timeout: int | None = None,
-    ) -> dict[str, Any]:
-        adapter = self._adapter()
-        original_timeout = getattr(adapter, "timeout", None)
-        if timeout is not None and hasattr(adapter, "timeout"):
-            adapter.timeout = int(timeout)
-        try:
-            response = adapter.chat(messages, json_schema=json_schema)
-        finally:
-            if timeout is not None and hasattr(adapter, "timeout"):
-                adapter.timeout = original_timeout
-        if not isinstance(response, dict):
-            raise ValueError("Structured LLM response was not a JSON object.")
-        return response
-
-    def _effective_parallel_workers(self) -> int:
-        requested = max(1, int(self.process_config.get("parallel_workers", 16)))
-        if self._uses_remote_backend():
-            capped = max(1, int(self.process_config.get("remote_parallel_workers", 2)))
-            return min(requested, capped)
-        return requested
-
-    def _effective_batch_size(self) -> int:
-        configured = self.process_config.get("batch_size")
-        if configured is not None:
-            return max(1, int(configured))
-        if not self._uses_remote_backend():
-            return 1
-        return max(1, int(self.process_config.get("remote_batch_size", 4)))
-
-    def _uses_remote_backend(self) -> bool:
-        base_url = str(self.process_config.get("base_url", "")).strip().lower()
-        if not base_url:
-            return False
-        return not any(host in base_url for host in ("localhost", "127.0.0.1", "0.0.0.0"))
-
-    def _review_reason(self, row: pd.Series, threshold: float) -> str:
-        confidence = self._safe_float(row.get("annotation_confidence")) or 0.0
-        reference = self._normalize_optional_text(row.get("annotation_reference_label"))
-        auto = self._normalize_optional_text(row.get("annotation_auto_label"))
-        intra_agreement = row.get("annotation_intra_agreement")
-        if intra_agreement is False:
-            return "annotation_disagreement"
-        if reference is not None and auto is not None and reference != auto:
-            return "label_disagreement"
-        if confidence < threshold:
-            return "low_confidence"
-        return "manual_review"
-
-    def _row_tokens(self, signal_value: Any, metadata: Any) -> list[str]:
-        tokens = self._tokenize(self._stringify_value(signal_value))
-        if metadata is not None:
-            tokens.extend(self._tokenize(self._stringify_metadata(metadata)))
-        return tokens
-
-    def _stringify_metadata(self, metadata: Any) -> str:
-        if isinstance(metadata, str):
-            return metadata
-        try:
-            return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
-        except TypeError:
-            return str(metadata)
-
-    def _stringify_value(self, value: Any) -> str:
-        if self._is_empty(value):
-            return ""
-        return str(value)
-
-    def _tokenize(self, text: str) -> list[str]:
-        return TOKEN_PATTERN.findall(text.lower())
-
-    def _cohen_kappa(self, reference: Sequence[str], predicted: Sequence[str]) -> float | None:
-        if len(reference) != len(predicted) or len(reference) < 2:
-            return None
-        labels = sorted(set(reference) | set(predicted))
-        observed = sum(1 for ref, pred in zip(reference, predicted, strict=False) if ref == pred) / len(reference)
-        expected = 0.0
-        ref_counts = Counter(reference)
-        pred_counts = Counter(predicted)
-        for label in labels:
-            expected += (ref_counts[label] / len(reference)) * (pred_counts[label] / len(predicted))
-        if math.isclose(1.0 - expected, 0.0):
-            return 1.0 if math.isclose(observed, 1.0) else 0.0
-        return float((observed - expected) / (1.0 - expected))
-
-    def _normalize_optional_text(self, value: Any) -> str | None:
-        if self._is_empty(value):
-            return None
-        normalized = str(value).strip()
-        return normalized or None
-
-    def _safe_float(self, value: Any) -> float | None:
-        if self._is_empty(value):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _safe_bool(self, value: Any) -> bool | None:
-        if self._is_empty(value):
-            return None
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"true", "yes", "1"}:
-                return True
-            if normalized in {"false", "no", "0"}:
-                return False
-            return None
-        try:
-            return bool(value)
-        except Exception:
-            return None
-
-    def _confidence_series(self, frame: pd.DataFrame) -> pd.Series:
-        if "annotation_confidence" not in frame.columns:
-            return pd.Series(index=frame.index, dtype=float)
-        return pd.to_numeric(frame["annotation_confidence"], errors="coerce")
-
-    def _is_empty(self, value: Any) -> bool:
+    def _json_ready(self, value: Any) -> Any:
         if value is None:
-            return True
-        if isinstance(value, str):
-            return not value.strip()
-        if isinstance(value, float) and math.isnan(value):
-            return True
-        return bool(pd.isna(value)) if not isinstance(value, (dict, list, tuple, set)) else False
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Mapping):
+            return {str(k): self._json_ready(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_ready(v) for v in value]
+        return str(value)
 
     def _read_dataframe(self, path: Path) -> pd.DataFrame:
         if path.suffix.lower() == ".csv":
             return pd.read_csv(path)
         if path.suffix.lower() in {".json", ".jsonl"}:
             return pd.read_json(path, lines=path.suffix.lower() == ".jsonl")
-        raise ValueError(f"Unsupported input dataset format '{path.suffix}'.")
+        raise ValueError(f"Unsupported dataframe format: {path.suffix}")
 
-    def _load_config(self, config: str | Path | Mapping[str, Any] | None) -> dict[str, Any]:
-        if config is None:
-            return {}
+    def _stage_output_dir(self, output_dir: Path, stage_name: str) -> Path:
+        if output_dir.name == stage_name:
+            return output_dir
+        return output_dir / stage_name
+
+    def _load_config(self, config: str | Path | Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(config, Mapping):
             return dict(config)
         path = Path(config)
@@ -1577,10 +452,3 @@ class DataAnnotationAgent(BaseAgent):
             logs.append(entry)
         print(entry, file=sys.stdout, flush=True)
         return entry
-
-    def _merge_logs(self, existing: list[str], new: list[str]) -> list[str]:
-        merged = list(existing)
-        for entry in new:
-            if entry not in merged:
-                merged.append(entry)
-        return merged

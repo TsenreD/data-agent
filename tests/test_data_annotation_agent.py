@@ -472,6 +472,43 @@ def test_annotation_quality_reports_inter_expert_and_intra_agreement(tmp_path) -
     assert result.metadata["annotation"]["quality"]["inter_expert_kappa"] == 1.0
 
 
+def test_annotation_prompt_adds_declared_fields_even_for_prelabeled_rows(monkeypatch, tmp_path) -> None:
+    output_dir = tmp_path / "data"
+    frame = pd.DataFrame(
+        {
+            "text": [
+                "Complete problem with enough detail",
+                "Incomplete fragment without enough detail",
+            ],
+            "label": ["42", "17"],
+            "source": ["math", "math"],
+        }
+    )
+    agent = DataAnnotationAgent(
+        config={
+            "project": {"modality": "text"},
+            "agents": {
+                "annotation": {
+                    "prompt": (
+                        "For rows with no label, try to solve the text problem. "
+                        'Set new field "has_complete_problem" to false for incomplete rows and true otherwise.'
+                    )
+                }
+            },
+        },
+        output_dir=output_dir,
+    )
+    monkeypatch.setattr(agent, "_build_model_adapter", lambda: DummyAnnotationPromptAdapter())
+
+    result = agent.execute({"dataframe": frame})
+
+    assert "has_complete_problem" in result.dataframe.columns
+    assert bool(result.dataframe.loc[0, "has_complete_problem"]) is True
+    assert bool(result.dataframe.loc[1, "has_complete_problem"]) is False
+    assert result.dataframe.loc[0, "label"] == "42"
+    assert result.dataframe.loc[1, "label"] == "17"
+
+
 def test_annotation_agent_prefers_cleaned_dataset_when_run_after_quality(tmp_path) -> None:
     output_dir = tmp_path / "data"
     (output_dir / "collection").mkdir(parents=True, exist_ok=True)

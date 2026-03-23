@@ -49,7 +49,7 @@ dev = [
 py-modules = ["annotation_agent", "cli"]
 
 [tool.setuptools.packages.find]
-include = ["agents*", "executor*", "models*"]
+include = ["agents*", "models*"]
 
 [tool.setuptools.package-data]
 "agents.data_collection" = ["Dockerfile.parse", "Dockerfile.eda", "skills/*/SKILL.md"]

@@ -25,7 +25,7 @@ def test_normalize_api_base_strips_chat_completions_suffix() -> None:
 
 
 def test_parse_output_accepts_plain_json() -> None:
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"execution_timeout_seconds": 0})
     records, notes = backend._parse_output('{"records":[{"text":"hello","title":"greeting"}],"notes":["ok"]}')
 
     assert records == [{"text": "hello", "title": "greeting"}]
@@ -33,7 +33,7 @@ def test_parse_output_accepts_plain_json() -> None:
 
 
 def test_parse_output_accepts_fenced_json() -> None:
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"execution_timeout_seconds": 0})
     records, notes = backend._parse_output('```json\n{"records":[{"text":"hello"}]}\n```')
 
     assert records == [{"text": "hello"}]
@@ -41,7 +41,7 @@ def test_parse_output_accepts_fenced_json() -> None:
 
 
 def test_parse_output_accepts_python_literal_dict_string() -> None:
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"execution_timeout_seconds": 0})
     records, notes = backend._parse_output("{'records': [{'text': 'hello'}], 'notes': ['ok']}")
 
     assert records == [{"text": "hello"}]
@@ -49,7 +49,7 @@ def test_parse_output_accepts_python_literal_dict_string() -> None:
 
 
 def test_parse_output_accepts_direct_dict_output() -> None:
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"execution_timeout_seconds": 0})
     records, notes = backend._parse_output({"records": [{"text": "hello"}], "notes": ["ok"]})
 
     assert records == [{"text": "hello"}]
@@ -57,7 +57,7 @@ def test_parse_output_accepts_direct_dict_output() -> None:
 
 
 def test_build_task_requires_github_search_before_writing_code() -> None:
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"execution_timeout_seconds": 0})
 
     task = backend._build_task(
         {
@@ -174,13 +174,16 @@ def test_effective_eda_imports_include_smolagents_safe_defaults() -> None:
 
 
 def test_backend_registers_search_tools() -> None:
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"execution_timeout_seconds": 0})
 
     assert [tool.name for tool in backend.tools] == ["web_search", "github_code_search"]
 
 
 def test_collection_backend_mounts_project_for_pdf_helper() -> None:
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(
+        model=object(),
+        agent_config={"execution_timeout_seconds": 0},
+    )
 
     kwargs = backend._build_executor_kwargs({"allow_network": False})
 
@@ -200,29 +203,17 @@ def test_collection_backend_allows_overriding_shm_size() -> None:
 def test_collect_passes_search_tools_to_code_agent(monkeypatch) -> None:
     captured = {}
 
-    class DummyExecutor:
-        def __init__(self, *args, **kwargs) -> None:
-            self.args = args
-            self.kwargs = kwargs
+    def fake_run_agent(self, **kwargs):
+        captured["tools"] = kwargs["tools"]
+        captured["instructions"] = kwargs["instructions"]
+        return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
 
-    class DummyAgent:
-        def __init__(self, *args, **kwargs) -> None:
-            captured["tools"] = kwargs["tools"]
-            captured["instructions"] = kwargs["instructions"]
+    monkeypatch.setattr(SmolagentsCollectionBackend, "_run_agent", fake_run_agent)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        def run(self, task, max_steps: int, return_full_result: bool):
-            return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
-
-    monkeypatch.setattr(smolagents_backend_module, "PrebakedDockerExecutor", DummyExecutor)
-    monkeypatch.setattr(smolagents_backend_module, "CodeAgent", DummyAgent)
-
-    backend = SmolagentsCollectionBackend(model=object())
+    backend = SmolagentsCollectionBackend(
+        model=object(),
+        agent_config={"execution_timeout_seconds": 0},
+    )
     result = backend.collect({"type": "scrape", "url": "https://example.com"})
 
     assert result.success is True
@@ -233,67 +224,49 @@ def test_collect_passes_search_tools_to_code_agent(monkeypatch) -> None:
 def test_collect_defaults_to_twenty_steps_per_attempt(monkeypatch) -> None:
     captured = {}
 
-    class DummyExecutor:
-        def __init__(self, *args, **kwargs) -> None:
-            self.args = args
-            self.kwargs = kwargs
+    def fake_run_agent(self, **kwargs):
+        captured["run_max_steps"] = kwargs["max_steps"]
+        return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
 
-    class DummyAgent:
-        def __init__(self, *args, **kwargs) -> None:
-            captured["agent_max_steps"] = kwargs["max_steps"]
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        def run(self, task, max_steps: int, return_full_result: bool):
-            captured["run_max_steps"] = max_steps
-            return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
-
-    monkeypatch.setattr(smolagents_backend_module, "PrebakedDockerExecutor", DummyExecutor)
-    monkeypatch.setattr(smolagents_backend_module, "CodeAgent", DummyAgent)
+    monkeypatch.setattr(SmolagentsCollectionBackend, "_run_agent", fake_run_agent)
 
     backend = SmolagentsCollectionBackend(model=object())
     result = backend.collect({"type": "scrape", "url": "https://example.com"})
 
     assert result.success is True
-    assert captured["agent_max_steps"] == 20
     assert captured["run_max_steps"] == 20
 
 
 def test_collect_uses_agent_config_defaults(monkeypatch) -> None:
     captured = {}
 
-    class DummyExecutor:
-        def __init__(self, *args, **kwargs) -> None:
-            self.args = args
-            self.kwargs = kwargs
+    def fake_run_agent(self, **kwargs):
+        captured["run_max_steps"] = kwargs["max_steps"]
+        return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
 
-    class DummyAgent:
-        def __init__(self, *args, **kwargs) -> None:
-            captured["agent_max_steps"] = kwargs["max_steps"]
+    monkeypatch.setattr(SmolagentsCollectionBackend, "_run_agent", fake_run_agent)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        def run(self, task, max_steps: int, return_full_result: bool):
-            captured["run_max_steps"] = max_steps
-            return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
-
-    monkeypatch.setattr(smolagents_backend_module, "PrebakedDockerExecutor", DummyExecutor)
-    monkeypatch.setattr(smolagents_backend_module, "CodeAgent", DummyAgent)
-
-    backend = SmolagentsCollectionBackend(model=object(), agent_config={"max_steps": 7})
+    backend = SmolagentsCollectionBackend(model=object(), agent_config={"max_steps": 7, "execution_timeout_seconds": 0})
     result = backend.collect({"type": "scrape", "url": "https://example.com"})
 
     assert result.success is True
-    assert captured["agent_max_steps"] == 7
     assert captured["run_max_steps"] == 7
+
+
+def test_collect_defaults_to_twenty_second_execution_timeout(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_agent(self, **kwargs):
+        captured["execution_timeout_seconds"] = kwargs["execution_timeout_seconds"]
+        return RunResult(output='{"records":[{"text":"hello"}]}', state="done", steps=[])
+
+    monkeypatch.setattr(SmolagentsCollectionBackend, "_run_agent", fake_run_agent)
+
+    backend = SmolagentsCollectionBackend(model=object())
+    result = backend.collect({"type": "scrape", "url": "https://example.com"})
+
+    assert result.success is True
+    assert captured["execution_timeout_seconds"] == 20
 
 
 def test_build_container_env_includes_github_token_from_flat_config() -> None:

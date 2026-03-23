@@ -398,10 +398,7 @@ class DataQualityAgent(BaseAgent):
                 print("Priority actions: " + ", ".join(str(item) for item in priority_actions))
         for index, strategy in enumerate(options, start=1):
             label = "recommended" if index == 1 else f"alternative {index - 1}"
-            print(
-                f"{index}. {label}: missing={strategy.get('missing')}, "
-                f"duplicates={strategy.get('duplicates')}, outliers={strategy.get('outliers')}"
-            )
+            print(f"{index}. {label}: {self._format_strategy_for_prompt(strategy)}")
 
         while True:
             response = input(f"Select cleaning strategy [1-{len(options)}] (default 1): ").strip()
@@ -412,6 +409,27 @@ class DataQualityAgent(BaseAgent):
                 if 1 <= selected <= len(options):
                     return selected - 1
             print("Invalid selection. Enter a listed number.")
+
+    def _format_strategy_for_prompt(self, strategy: Mapping[str, Any]) -> str:
+        summary_parts = [
+            f"missing={strategy.get('missing')}",
+            f"duplicates={strategy.get('duplicates')}",
+            f"outliers={strategy.get('outliers')}",
+        ]
+        rich_keys = [
+            "column_actions",
+            "row_actions",
+            "text_actions",
+            "target_actions",
+            "label_actions",
+        ]
+        for key in rich_keys:
+            value = strategy.get(key)
+            if isinstance(value, list) and value:
+                summary_parts.append(f"{key}={','.join(str(item) for item in value[:3])}")
+            elif isinstance(value, str) and value.strip():
+                summary_parts.append(f"{key}={value.strip()}")
+        return "; ".join(summary_parts)
 
     def _normalized_label_column(self, dataframe: pd.DataFrame | None = None) -> str | None:
         if isinstance(self.label_column, str) and self.label_column.strip():
@@ -429,13 +447,13 @@ class DataQualityAgent(BaseAgent):
         *,
         notebook_path: Path,
     ) -> QualityArtifacts:
-        report_path = self.output_dir / "quality_report.json"
-        analysis_path = self.output_dir / "quality_analysis.json"
-        comparison_path = self.output_dir / "quality_comparison.json"
+        report_path = self.output_dir / "quality_report.md"
+        analysis_path = self.output_dir / "quality_analysis.md"
+        comparison_path = self.output_dir / "quality_comparison.md"
         cleaned_dataset_path = self.output_dir / "cleaned_dataset.jsonl"
-        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-        analysis_path.write_text(json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8")
-        comparison_path.write_text(json.dumps(comparison, indent=2, ensure_ascii=False), encoding="utf-8")
+        report_path.write_text(self._format_quality_report(report), encoding="utf-8")
+        analysis_path.write_text(self._format_quality_analysis(analysis), encoding="utf-8")
+        comparison_path.write_text(self._format_quality_comparison(comparison), encoding="utf-8")
         cleaned.to_json(cleaned_dataset_path, orient="records", lines=True, force_ascii=False, date_format="iso")
         return QualityArtifacts(
             report_path=report_path,
@@ -444,6 +462,165 @@ class DataQualityAgent(BaseAgent):
             comparison_path=comparison_path,
             notebook_path=notebook_path,
         )
+
+    def _format_quality_report(self, report: Mapping[str, Any]) -> str:
+        missing = report.get("missing", {}) if isinstance(report.get("missing"), Mapping) else {}
+        outliers = report.get("outlier_summary", {}) if isinstance(report.get("outlier_summary"), Mapping) else {}
+        imbalance = report.get("imbalance", {}) if isinstance(report.get("imbalance"), Mapping) else {}
+        text_profile = report.get("text_profile", {}) if isinstance(report.get("text_profile"), Mapping) else {}
+        insights = [
+            self._insight_line("Missing values", missing.get("total"), "cells need imputation or row-level handling"),
+            self._insight_line("Duplicate rows", report.get("duplicates"), "rows may distort evaluation and training"),
+            self._insight_line("Numeric outliers", outliers.get("total"), "values may need clipping, filtering, or review"),
+        ]
+        if imbalance.get("column"):
+            majority_share = imbalance.get("majority_share")
+            if isinstance(majority_share, (int, float)):
+                insights.append(
+                    f"- Label imbalance is tracked on `{imbalance['column']}` with majority share `{float(majority_share):.3f}`."
+                )
+            else:
+                insights.append(f"- Label imbalance is tracked on `{imbalance['column']}`.")
+        if text_profile:
+            empty_rows = text_profile.get("empty_rows")
+            duplicate_text_rows = text_profile.get("duplicate_text_rows")
+            if empty_rows:
+                insights.append(f"- `{empty_rows}` rows have empty text content.")
+            if duplicate_text_rows:
+                insights.append(f"- `{duplicate_text_rows}` rows repeat the same text payload.")
+        insights = [line for line in insights if line]
+        return "\n".join(
+            [
+                "# Quality Findings",
+                "",
+                "## Executive Summary",
+                "",
+                *(insights or ["- No major quality issues were surfaced by the detector."]),
+                "",
+                "## Key Metrics",
+                "",
+                f"- Missing values: `{missing.get('total', 0)}`",
+                f"- Duplicate rows: `{report.get('duplicates', 0)}`",
+                f"- Numeric outliers: `{outliers.get('total', 0)}`",
+                f"- Imbalance column: `{imbalance.get('column', 'n/a')}`",
+                "",
+                "## What To Read First",
+                "",
+                "- Focus on the largest counts above, not the full raw issue object.",
+                "- Use the analysis report for why the issues matter for the current ML task.",
+                "- Use the comparison report to see what changed after cleaning.",
+                "",
+            ]
+        )
+
+    def _format_quality_analysis(self, analysis: Mapping[str, Any]) -> str:
+        task = analysis.get("task_interpretation", {}) if isinstance(analysis.get("task_interpretation"), Mapping) else {}
+        focus = analysis.get("quality_focus", {}) if isinstance(analysis.get("quality_focus"), Mapping) else {}
+        recommended = analysis.get("recommended_strategy", {}) if isinstance(analysis.get("recommended_strategy"), Mapping) else {}
+        alternatives = analysis.get("alternative_strategies", []) if isinstance(analysis.get("alternative_strategies"), list) else []
+        lines = [
+            "# Quality Analysis",
+            "",
+            "## Task Reading",
+            "",
+            f"- Task type: `{task.get('task_type', 'unknown')}`",
+            f"- Primary modality: `{focus.get('primary_modality', task.get('primary_modality', 'unknown'))}`",
+            f"- Label semantics: {task.get('label_semantics', task.get('target_role', 'unknown'))}",
+            "",
+            "## Recommended Strategy",
+            "",
+            f"- Missing values: `{recommended.get('missing', 'unknown')}`",
+            f"- Duplicates: `{recommended.get('duplicates', 'unknown')}`",
+            f"- Outliers: `{recommended.get('outliers', 'unknown')}`",
+            "",
+            "## Why This Matters",
+            "",
+            f"{str(analysis.get('justification', '')).strip() or 'The analyzer did not provide a justification.'}",
+            "",
+            "## Priority Actions",
+            "",
+            *self._markdown_list(focus.get("priority_actions"), fallback="- No priority actions were listed."),
+            "",
+            "## Relevant Checks",
+            "",
+            *self._markdown_list(focus.get("relevant_checks"), fallback="- No relevant checks were listed."),
+            "",
+            "## Lower-Value Checks",
+            "",
+            *self._markdown_list(focus.get("irrelevant_checks"), fallback="- None were explicitly deprioritized."),
+        ]
+        if alternatives:
+            lines.extend(
+                [
+                    "",
+                    "## Alternative Strategies",
+                    "",
+                ]
+            )
+            for index, strategy in enumerate(alternatives[:3], start=1):
+                if not isinstance(strategy, Mapping):
+                    continue
+                lines.append(
+                    f"- Option {index}: missing=`{strategy.get('missing', 'unknown')}`, "
+                    f"duplicates=`{strategy.get('duplicates', 'unknown')}`, "
+                    f"outliers=`{strategy.get('outliers', 'unknown')}`"
+                )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _format_quality_comparison(self, comparison: Mapping[str, Any]) -> str:
+        missing = comparison.get("missing", {}) if isinstance(comparison.get("missing"), Mapping) else {}
+        duplicates = comparison.get("duplicates", {}) if isinstance(comparison.get("duplicates"), Mapping) else {}
+        outliers = comparison.get("outliers", {}) if isinstance(comparison.get("outliers"), Mapping) else {}
+        imbalance = comparison.get("imbalance", {}) if isinstance(comparison.get("imbalance"), Mapping) else {}
+        outcome_lines = [
+            self._delta_line("Missing values", missing.get("before_total"), missing.get("after_total")),
+            self._delta_line("Duplicate rows", duplicates.get("before"), duplicates.get("after")),
+            self._delta_line("Numeric outliers", outliers.get("before_total"), outliers.get("after_total")),
+        ]
+        majority_after = imbalance.get("after_majority_share")
+        if majority_after is not None:
+            outcome_lines.append(f"- Majority-class share after cleaning: `{float(majority_after):.3f}`")
+        return "\n".join(
+            [
+                "# Quality Comparison",
+                "",
+                "## Before / After",
+                "",
+                "| Metric | Before | After |",
+                "| --- | ---: | ---: |",
+                f"| Missing values | {missing.get('before_total', 0)} | {missing.get('after_total', 0)} |",
+                f"| Duplicate rows | {duplicates.get('before', 0)} | {duplicates.get('after', 0)} |",
+                f"| Numeric outliers | {outliers.get('before_total', 0)} | {outliers.get('after_total', 0)} |",
+                "",
+                "## Practical Takeaway",
+                "",
+                *(outcome_lines or ["- No before/after metrics were available."]),
+                "",
+            ]
+        )
+
+    def _markdown_list(self, values: Any, *, fallback: str) -> list[str]:
+        if not isinstance(values, list) or not values:
+            return [fallback]
+        return [f"- {value}" for value in values[:6]]
+
+    def _insight_line(self, label: str, value: Any, detail: str) -> str:
+        if value is None:
+            return ""
+        return f"- {label}: `{value}`. {detail.capitalize()}."
+
+    def _delta_line(self, label: str, before: Any, after: Any) -> str:
+        if before is None or after is None:
+            return f"- {label}: not available."
+        delta = before - after if isinstance(before, (int, float)) and isinstance(after, (int, float)) else None
+        if delta is None:
+            return f"- {label}: `{before}` -> `{after}`."
+        if delta > 0:
+            return f"- {label}: improved by `{delta}` (`{before}` -> `{after}`)."
+        if delta < 0:
+            return f"- {label}: increased by `{abs(delta)}` (`{before}` -> `{after}`)."
+        return f"- {label}: unchanged at `{after}`."
 
     def _append_notebook_section(
         self,

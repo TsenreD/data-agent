@@ -80,10 +80,27 @@ class DummyQualityBackend:
                         "missing": "median",
                         "duplicates": "drop",
                         "outliers": "keep",
+                        "column_actions": ["drop_audio_column"],
+                        "row_actions": ["preserve_unlabeled_rows_for_inference"],
+                        "label_actions": ["validate_solution_format_consistency"],
                     },
                     "alternative_strategies": [
-                        {"missing": "median", "duplicates": "drop", "outliers": "keep"},
-                        {"missing": "drop", "duplicates": "drop", "outliers": "keep"},
+                        {
+                            "missing": "median",
+                            "duplicates": "drop",
+                            "outliers": "keep",
+                            "column_actions": ["drop_audio_column"],
+                            "row_actions": ["keep_only_rows_with_text"],
+                            "label_actions": ["validate_solution_format_consistency"],
+                        },
+                        {
+                            "missing": "drop",
+                            "duplicates": "drop",
+                            "outliers": "keep",
+                            "column_actions": ["drop_audio_column"],
+                            "row_actions": ["drop_rows_missing_label"],
+                            "label_actions": ["keep_original_labels_only"],
+                        },
                     ],
                     "quality_focus": {
                         "relevant_checks": ["missing_text", "duplicate_problems", "normalized_text_duplicates"],
@@ -228,6 +245,9 @@ def test_execute_consumes_upstream_agent_result_and_writes_artifacts(monkeypatch
     assert Path(result.artifacts["quality_comparison"]).exists()
     assert Path(result.artifacts["cleaned_dataset"]).exists()
     assert Path(result.artifacts["eda_notebook"]).exists()
+    assert Path(result.artifacts["quality_report"]).read_text(encoding="utf-8").startswith("# Quality Findings")
+    assert "## Recommended Strategy" in Path(result.artifacts["quality_analysis"]).read_text(encoding="utf-8")
+    assert "| Metric | Before | After |" in Path(result.artifacts["quality_comparison"]).read_text(encoding="utf-8")
     assert result.metadata["quality_strategy"]["outliers"] == "keep"
     assert result.metadata["quality_decision"]["mode"] == "automatic"
     assert result.metadata["quality_justification"]
@@ -284,6 +304,7 @@ def test_execute_prompts_user_to_choose_strategy(monkeypatch, tmp_path, capsys) 
 
     captured = capsys.readouterr()
     assert "Data Quality Analyzer Suggestions" in captured.out
+    assert "row_actions=drop_rows_missing_label" in captured.out
     assert result.metadata["quality_decision"]["mode"] == "human_in_the_loop"
     assert result.metadata["quality_decision"]["selected_option"] == 2
-    assert agent.backend.fix_calls[0][2]["missing"] == "drop"
+    assert agent.backend.fix_calls[0][2]["row_actions"] == ["keep_only_rows_with_text"]

@@ -456,8 +456,14 @@ class ActiveLearningAgent(BaseAgent):
             feature_columns = self._infer_feature_columns(frame, prompt)
         if not feature_columns:
             raise ValueError("ActiveLearningAgent could not identify text feature columns for the task prompt.")
-        if isinstance(target_override, str) and target_override in frame.columns:
-            target_column = target_override
+        if isinstance(target_override, str):
+            if target_override in frame.columns:
+                target_column = target_override
+            else:
+                raise ValueError(
+                    f"ActiveLearningAgent target_column {target_override!r} was configured but is missing from the dataframe. "
+                    "Check that the upstream annotation stage actually created this field."
+                )
         else:
             target_column = self._infer_target_column(frame, prompt)
         return TaskSelection(feature_columns=feature_columns, target_column=target_column, task_prompt=prompt)

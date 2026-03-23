@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import json
 import os
 import re
+import signal
 import socket
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -320,6 +321,7 @@ class _SmolagentsDockerBackendBase:
         additional_imports: list[str],
         max_steps: int,
         source: Mapping[str, Any] | None = None,
+        execution_timeout_seconds: int | None = None,
     ) -> RunResult:
         logger = AgentLogger(level=LogLevel.ERROR)
         with _localhost_proxy_bypass():
@@ -340,7 +342,8 @@ class _SmolagentsDockerBackendBase:
                 verbosity_level=1,
                 instructions=instructions,
             ) as agent:
-                run_result = agent.run(task, max_steps=max_steps, return_full_result=True)
+                with _agent_run_timeout(execution_timeout_seconds):
+                    run_result = agent.run(task, max_steps=max_steps, return_full_result=True)
         assert isinstance(run_result, RunResult)
         return run_result
 
@@ -437,6 +440,12 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
                     additional_imports=AUTHORIZED_IMPORTS,
                     max_steps=max_steps,
                     source=source,
+                    execution_timeout_seconds=int(
+                        source.get(
+                            "execution_timeout_seconds",
+                            self.agent_config.get("execution_timeout_seconds", 20),
+                        )
+                    ),
                 )
                 raw_output = "" if run_result.output is None else str(run_result.output)
                 records, notes = self._parse_output(raw_output)
@@ -1268,6 +1277,38 @@ def _is_local_port_free(host: str, port: int) -> bool:
         except OSError:
             return False
     return True
+
+
+@contextmanager
+def _agent_run_timeout(timeout_seconds: int | None):
+    if timeout_seconds is None or timeout_seconds <= 0:
+        yield
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        yield
+        return
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        yield
+        return
+
+    def _handle_timeout(signum, frame):
+        raise TimeoutError(f"Agent execution timed out after {timeout_seconds} seconds.")
+
+    try:
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, _handle_timeout)
+        signal.setitimer(signal.ITIMER_REAL, float(timeout_seconds))
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+        except Exception:
+            pass
 
 
 def _find_free_local_port() -> int:
