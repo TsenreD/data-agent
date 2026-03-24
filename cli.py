@@ -71,13 +71,13 @@ def build_runner(config_path: Path, output_dir: Path) -> PipelineRunner:
                 output_dir=output_dir,
             )
         )
-    if _agent_enabled(config, "active_learning"):
-        agents.append(
-            ActiveLearningAgent(
-                config=config_path,
-                output_dir=output_dir,
-            )
-        )
+    # if _agent_enabled(config, "active_learning"):
+    #     agents.append(
+    #         ActiveLearningAgent(
+    #             config=config_path,
+    #             output_dir=output_dir,
+    #         )
+    #     )
     return PipelineRunner(agents)
 
 

@@ -57,14 +57,15 @@ agents:
       Solve the text problem, put your answer in \boxed{}.
       If a problem is incomplete (and has no solution), set label to "invalid".
     process_config:
-      parallel_workers: 200
+      parallel_workers: 30
       timeout_per_row: 120
-      max_retries: 1
+      max_retries: 2
       max_tokens: 8192
   active_learning:
     task_prompt: |
       Train classification model to determine whether text contains a full problem, or an incomplete one.
-    target_column: has_complete_problem
+      Use fasttext as base model, train a classification head on top.
+    target_column: label
     feature_columns:
       - text
     strategy: entropy
@@ -83,7 +84,7 @@ sources:
   - type: hf_dataset
     name: madrylab/gsm8k-platinum
     split: test
-    limit: 100
+    limit: 50
     column_map:
       text: question
       label: answer
@@ -97,7 +98,7 @@ sources:
   - type: scrape 
     name: all-russian
     url: https://vos.olimpiada.ru/2025/invite/tasks
-    limit: 50
+    limit: 40
     allow_network: true
     extraction_instructions: |
       Extract one record per actual olympiad problem, not one record per year page.

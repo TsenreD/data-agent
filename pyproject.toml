@@ -53,6 +53,6 @@ include = ["agents*", "models*"]
 
 [tool.setuptools.package-data]
 "agents.data_collection" = ["Dockerfile.parse", "Dockerfile.eda", "skills/*/SKILL.md"]
-"agents.data_annotation" = ["spec.md"]
+"agents.data_annotation" = ["spec.md", "skills/*/SKILL.md"]
 "agents.active_learning" = ["spec.md"]
 "agents.data_quality" = ["skills/*/SKILL.md"]

@@ -14,26 +14,27 @@
 
 ## Why This Matters
 
-This is a math reasoning dataset where the primary value is the problem-solution pairs. The recommended retention-oriented strategy is better than supervised-only because: (1) all 124 rows contain valid, informative math problems regardless of label status; (2) the 24 unlabeled rows can be used for inference evaluation or future label generation; (3) dropping them would lose 19% of the data without justification. The audio/image columns are entirely null and should be dropped as they serve no purpose. The 'outliers' in text length are legitimate long problems, not errors. Class balance analysis is meaningless here since each problem has a unique solution - this is not a classification task.
+This is a math reasoning dataset where the task is to solve math word problems. The 'label' column contains detailed chain-of-thought solutions, not simple class labels. The 20 rows with null labels are NOT missing data to impute - they are intentionally unlabeled math problems from project-euler and all-russian sources. Generic imputation strategies like 'median' for missing values are inappropriate here because: (1) these are not numeric values to average, (2) the unlabeled rows are valid problems that could be used for inference or labeled later. The recommended strategy preserves all 30 rows, drops the useless audio column, and keeps the dataset as a mixed supervised/unsupervised math problem collection. This maximizes utility for potential downstream tasks like math problem solving, curriculum learning, or active learning label generation.
 
 ## Priority Actions
 
-- drop_unused_columns_audio_image
-- preserve_all_rows_including_unlabeled
-- flag_unlabeled_rows_by_source
+- drop_audio_column
+- preserve_unlabeled_rows_for_potential_label_generation
+- keep_image_urls_as_optional_reference
 
 ## Relevant Checks
 
-- text_non_empty - all 124 rows have valid text
-- label_format_validity - labels follow CoT format with '#### <answer>'
-- source_distribution - tracks provenance across 3 sources
-- metadata_completeness - metadata present for all rows
+- text_completeness_all_30_rows_have_valid_text
+- label_format_verification_labels_use_chain_of_thought_format
+- source_balance_three_sources_10_each
+- text_length_distribution_math_problem_typical_lengths
 
 ## Lower-Value Checks
 
-- class_balance_plots - not applicable; each label is unique (each math problem has unique solution)
-- numeric_outlier_detection - 15 text length 'outliers' are legitimate long problems, not errors
-- audio_image_modality_checks - these columns are entirely null and should be dropped
+- class_balance_plots_not_useful_for_numeric_math_answers
+- outlier_detection_not_applicable_text_domain
+- imputation_for_missing_labels_not_recommended
+- audio_column_analysis_all_null
 
 ## Alternative Strategies
 

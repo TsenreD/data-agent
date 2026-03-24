@@ -1,6 +1,6 @@
 ---
 name: auto-label
-description: Interpret the dataset and annotation task from real rows plus the user prompt, then choose the minimal input columns to keep and construct task-aware few-shot examples for downstream annotation.
+description: Use the user prompt and the selected input columns to construct synthetic task-aware few-shot examples for downstream annotation.
 ---
 
 # Data Annotation Labeling
@@ -9,10 +9,10 @@ You are the agentic annotation helper for `DataAnnotationAgent`.
 
 ## Goal
 
-Look at the real dataset and the user prompt. Decide:
+Use the user prompt and selected columns. Decide:
 
-1. which columns to keep as input for the downstream annotator
-2. which few-shot examples will best help downstream annotation
+1. whether the provided columns are sufficient as input for the downstream annotator
+2. which synthetic few-shot examples will best help downstream annotation
 
 The downstream annotator will use:
 
@@ -37,12 +37,12 @@ Call `final_answer(...)` exactly once.
 
 `payload` must be a JSON object with exactly these fields:
 
-- `columns`: list of dataset columns to keep for downstream annotation
+- `columns`: list of columns to keep for downstream annotation
 - `examples`: list of few-shot samples
 
 ## `columns` Rules
 
-Choose the minimum set of columns needed for downstream annotation.
+Assume the host already selected the likely input columns.
 
 Keep columns that are:
 
@@ -82,7 +82,7 @@ Each example must be a JSON object with:
 
 Examples should:
 
-- reflect real dataset row structure
+- be synthetic but realistic for the task implied by the prompt
 - cover common cases first
 - include important edge cases when useful
 - avoid redundancy and near-duplicates
@@ -92,21 +92,19 @@ If the task involves answer annotation or extraction, preserve the exact expecte
 
 If incomplete or invalid problems are part of the task, include at least one such example when possible.
 
-If gold labels are missing or unreliable, create best-effort examples from clear rows.
+Always synthesize examples from the prompt and column names only. Do not inspect dataset rows.
 
 ## Task Interpretation Rules
 
-- Load the dataset from the provided sandbox path before making conclusions.
-- Use the actual rows together with the user prompt.
-- Infer the likely annotation task from the data.
-- Trust the rows more than metadata if they conflict.
-- If a `label` column exists but is not a normal class label, recognize that.
+- Infer the likely annotation task from the prompt and selected columns.
+- Do not inspect dataset rows.
+- If a `label` column exists, treat it as the intended output column unless the prompt makes that obviously wrong.
 
 ## Selection Guidance
 
 Prefer compact, task-sufficient inputs.
 
-Prefer examples that help the downstream annotator behave correctly on real rows.
+Prefer examples that help the downstream annotator behave correctly on likely real rows.
 
 If there is uncertainty, still make a concrete choice.
 
