@@ -1,5 +1,6 @@
 import ast
 from contextlib import contextmanager
+import importlib.util
 import json
 import os
 import re
@@ -255,6 +256,7 @@ class _SmolagentsLocalBackendBase:
         execution_timeout_seconds: int | None = None,
     ) -> RunResult:
         source = source or {}
+        effective_imports = _filter_installed_authorized_imports(additional_imports)
         local_task = task
         if source.get("allow_network") is False:
             local_task = (
@@ -267,7 +269,7 @@ class _SmolagentsLocalBackendBase:
                 tools=tools,
                 model=self.model,
                 executor_type="local",
-                additional_authorized_imports=additional_imports,
+                additional_authorized_imports=effective_imports,
                 max_steps=max_steps,
                 verbosity_level=1,
                 instructions=instructions,
@@ -1063,6 +1065,34 @@ def _merge_no_proxy_values(existing: str | None, required: str) -> str:
         if candidate and candidate not in values:
             values.append(candidate)
     return ",".join(values)
+
+
+def _filter_installed_authorized_imports(import_names: list[str]) -> list[str]:
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for import_name in import_names:
+        candidate = str(import_name).strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if _is_import_available(candidate):
+            filtered.append(candidate)
+    return filtered
+
+
+def _is_import_available(import_name: str) -> bool:
+    try:
+        if importlib.util.find_spec(import_name) is not None:
+            return True
+    except (ImportError, ModuleNotFoundError, ValueError):
+        pass
+    if "." in import_name:
+        root = import_name.split(".", 1)[0]
+        try:
+            return importlib.util.find_spec(root) is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return False
+    return False
 
 
 @contextmanager
