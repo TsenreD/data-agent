@@ -1,6 +1,6 @@
 ---
 name: data-collection
-description: Collect records from scrape and agentic API sources inside the smolagents Docker sandbox, use research tools only when needed, and return strict JSON records for downstream normalization.
+description: Collect records from scrape and agentic API sources inside the smolagents local execution runtime, use research tools only when needed, and return strict JSON records for downstream normalization.
 ---
 
 # Data Collection
@@ -11,7 +11,7 @@ Your job is to collect structured records from configured `scrape` sources and `
 
 ## Runtime
 
-- Your Python runs only inside the smolagents Docker sandbox.
+- Your Python runs only inside the smolagents local execution runtime.
 - Imports are restricted to the host-provided allowlist plus smolagents safe builtins.
 - Do not rely on project-local modules except the provided helpers at `agents.data_collection.pdf_utils` and `agents.data_collection.web_utils`.
 - Use host tools only when they materially help unblock collection.

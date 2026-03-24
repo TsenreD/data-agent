@@ -5,9 +5,6 @@ import os
 import pickle
 import random
 import re
-import runpy
-import subprocess
-import sys
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,13 +64,14 @@ DEFAULT_REPORT_PATH = "active_learning_curve.png"
 DEFAULT_SCRIPT_PATH = "train_active_learning.py"
 DEFAULT_MODEL_PATH = "model.pth"
 DEFAULT_TRAINING_METRICS_PATH = "training_metrics.json"
-DEFAULT_TRAINING_IMAGE = "data-agent-active-learning-train"
-DEFAULT_DOCKER_MEMORY_LIMIT = "16g"
-DEFAULT_DOCKER_CPU_LIMIT = 8.0
-DEFAULT_DOCKER_PIDS_LIMIT = 2048
-DEFAULT_DOCKER_SHM_SIZE = "8g"
+DEFAULT_EMBEDDING_DIM = 64
+DEFAULT_EPOCHS = 20
+DEFAULT_TRAIN_BATCH_SIZE = 32
+DEFAULT_LEARNING_RATE = 0.05
+DEFAULT_MAX_VOCAB = 5000
+DEFAULT_MIN_TOKEN_FREQ = 1
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-TRAIN_DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile.train")
+DEFAULT_AGENT_MAX_STEPS = 8
 
 
 @dataclass(slots=True)
@@ -197,6 +195,17 @@ def _softmax_rows(logits: np.ndarray) -> np.ndarray:
     exp = np.exp(shifted)
     sums = np.clip(exp.sum(axis=1, keepdims=True), 1e-12, None)
     return exp / sums
+
+
+def _default_training_config() -> dict[str, Any]:
+    return {
+        "embedding_dim": DEFAULT_EMBEDDING_DIM,
+        "epochs": DEFAULT_EPOCHS,
+        "batch_size": DEFAULT_TRAIN_BATCH_SIZE,
+        "learning_rate": DEFAULT_LEARNING_RATE,
+        "max_vocab": DEFAULT_MAX_VOCAB,
+        "min_token_freq": DEFAULT_MIN_TOKEN_FREQ,
+    }
 
 
 def _encode_labels(labels: Sequence[str]) -> tuple[list[str], np.ndarray]:
@@ -339,7 +348,6 @@ def train_text_classifier(
 
     if val_texts:
         x_val = vectorizer.transform(val_texts)
-        y_val = np.asarray([label_to_index[str(label)] for label in val_labels], dtype=np.int64)
         eval_features = x_val
         eval_truth = [str(item) for item in val_labels]
     else:
@@ -415,9 +423,10 @@ def run_training_job(config_path: str | Path) -> dict[str, Any]:
     train_df = pd.read_json(train_path, lines=True)
     val_df = pd.read_json(val_path, lines=True) if val_path.exists() else pd.DataFrame(columns=train_df.columns)
 
-    train_texts = _compose_texts_from_frame(train_df, feature_columns)
+    task_prompt = str(payload.get("task_prompt") or "").strip()
+    train_texts = _compose_texts_from_frame(train_df, feature_columns, task_prompt=task_prompt)
     train_labels = [_normalize_label_value(item) for item in train_df[target_column].tolist()]
-    val_texts = _compose_texts_from_frame(val_df, feature_columns)
+    val_texts = _compose_texts_from_frame(val_df, feature_columns, task_prompt=task_prompt)
     val_labels = [_normalize_label_value(item) for item in val_df[target_column].tolist()] if not val_df.empty else []
 
     model, metrics, checkpoint = train_text_classifier(
@@ -425,7 +434,7 @@ def run_training_job(config_path: str | Path) -> dict[str, Any]:
         train_labels,
         val_texts=val_texts,
         val_labels=val_labels,
-        training_config=payload.get("training", {}),
+        training_config=_default_training_config(),
         random_seed=int(payload.get("random_seed", 13)),
     )
 
@@ -440,7 +449,14 @@ def run_training_job(config_path: str | Path) -> dict[str, Any]:
     return metrics
 
 
-def _compose_texts_from_frame(frame: pd.DataFrame, feature_columns: Sequence[str]) -> list[str]:
+def _compose_texts_from_frame(
+    frame: pd.DataFrame,
+    feature_columns: Sequence[str],
+    *,
+    task_prompt: str | None = None,
+) -> list[str]:
+    prompt = (task_prompt or "").strip()
+    prefix = f"Task: {prompt}\n" if prompt else ""
     texts: list[str] = []
     for _, row in frame.iterrows():
         chunks: list[str] = []
@@ -449,7 +465,11 @@ def _compose_texts_from_frame(frame: pd.DataFrame, feature_columns: Sequence[str
             if pd.isna(value):
                 continue
             chunks.append(str(value))
-        texts.append("\n".join(chunks))
+        body = "\n".join(chunks)
+        if prefix:
+            texts.append(prefix + body)
+        else:
+            texts.append(body)
     return texts
 
 
@@ -478,8 +498,7 @@ class ActiveLearningAgent(BaseAgent):
         self.batch_size = int(self.active_config.get("batch_size", DEFAULT_BATCH_SIZE))
         self.test_size = float(self.active_config.get("test_size", 0.25))
         self.random_seed = int(self.active_config.get("random_seed", 13))
-        self.training_config = self._resolve_training_config()
-        self.docker_config = self._resolve_docker_config()
+        self.agent_max_steps = int(self.active_config.get("max_steps", DEFAULT_AGENT_MAX_STEPS))
         self._model: CheckpointClassifier | None = None
 
     def run(self, dataframe: pd.DataFrame, task_prompt: str | None = None) -> pd.DataFrame:
@@ -600,16 +619,16 @@ class ActiveLearningAgent(BaseAgent):
         selection: TaskSelection,
     ) -> tuple[CheckpointClassifier, dict[str, float | int | str]]:
         train_df, val_df = self._split_train_test(labeled_df, selection.target_column)
-        train_texts = self._compose_texts(train_df, selection.feature_columns)
+        train_texts = self._compose_texts(train_df, selection.feature_columns, task_prompt=selection.task_prompt)
         train_labels = self._target_labels(train_df, selection.target_column)
-        val_texts = self._compose_texts(val_df, selection.feature_columns)
+        val_texts = self._compose_texts(val_df, selection.feature_columns, task_prompt=selection.task_prompt)
         val_labels = self._target_labels(val_df, selection.target_column) if not val_df.empty else []
         model, metrics, _ = train_text_classifier(
             train_texts,
             train_labels,
             val_texts=val_texts,
             val_labels=val_labels,
-            training_config=self.training_config,
+            training_config=_default_training_config(),
             random_seed=self.random_seed,
         )
         return model, metrics
@@ -625,7 +644,7 @@ class ActiveLearningAgent(BaseAgent):
             raise ValueError("Model must be fit before querying.")
         working = pool_df.copy()
         working["__row_index"] = working.index.astype(int)
-        texts = self._compose_texts(working, selection.feature_columns)
+        texts = self._compose_texts(working, selection.feature_columns, task_prompt=selection.task_prompt)
         probabilities = self._model.predict_proba(texts)
         working["active_learning_score"] = self._uncertainty_scores(probabilities, strategy)
         working = working.sort_values("active_learning_score", ascending=False, kind="stable").copy()
@@ -646,7 +665,9 @@ class ActiveLearningAgent(BaseAgent):
             raise ValueError("Model must be fit before evaluation.")
         evaluation_frame = labeled_df if test_df is None or test_df.empty else test_df
         truth = self._target_labels(evaluation_frame, selection.target_column)
-        predicted = estimator.predict(self._compose_texts(evaluation_frame, selection.feature_columns))
+        predicted = estimator.predict(
+            self._compose_texts(evaluation_frame, selection.feature_columns, task_prompt=selection.task_prompt)
+        )
         return {
             "accuracy": self._accuracy(truth, predicted),
             "macro_f1": self._macro_f1(truth, predicted),
@@ -874,7 +895,7 @@ class ActiveLearningAgent(BaseAgent):
             "val_path": str(val_dataset_path),
             "feature_columns": selection.feature_columns,
             "target_column": selection.target_column,
-            "training": self.training_config,
+            "task_prompt": selection.task_prompt,
             "random_seed": self.random_seed,
             "model_path": str(model_path),
             "metrics_path": str(training_metrics_path),
@@ -916,10 +937,7 @@ class ActiveLearningAgent(BaseAgent):
         )
 
     def _run_generated_training(self, artifacts: ActiveLearningArtifacts, logs: list[str]) -> dict[str, Any]:
-        if self.docker_config["enabled"]:
-            self._run_training_in_docker(artifacts)
-        else:
-            self._run_training_locally(artifacts)
+        self._run_training_locally_with_code_agent(artifacts=artifacts)
 
         if not artifacts.training_metrics_path.exists():
             raise RuntimeError("Generated training script did not produce training metrics.")
@@ -927,100 +945,25 @@ class ActiveLearningAgent(BaseAgent):
             raise RuntimeError("Generated training script did not produce model checkpoint.")
 
         metrics = json.loads(artifacts.training_metrics_path.read_text(encoding="utf-8"))
-        location = "docker" if self.docker_config["enabled"] else "local interpreter"
-        self._record_log(f"Generated training script executed via {location}: {artifacts.train_script_path}", logs)
+        self._record_log(
+            f"Generated training script executed via local CodeAgent: {artifacts.train_script_path}",
+            logs,
+        )
         return metrics
 
-    def _run_training_locally(self, artifacts: ActiveLearningArtifacts) -> None:
-        training_config_path = self.output_dir / "training_job_config.json"
-        previous_argv = list(sys.argv)
-        try:
-            sys.argv = [str(artifacts.train_script_path), "--config", str(training_config_path)]
-            runpy.run_path(str(artifacts.train_script_path), run_name="__main__")
-        except SystemExit as exit_signal:
-            code = int(exit_signal.code) if isinstance(exit_signal.code, int) else 1
-            if code != 0:
-                raise RuntimeError(f"Generated training script failed with exit code {code}.") from exit_signal
-        finally:
-            sys.argv = previous_argv
-
-    def _run_training_in_docker(self, artifacts: ActiveLearningArtifacts) -> None:
-        if not TRAIN_DOCKERFILE_PATH.exists():
-            raise RuntimeError(f"Active-learning Dockerfile is missing: {TRAIN_DOCKERFILE_PATH}")
-
-        output_mount_host = self.output_dir.resolve()
-        output_mount_container = "/training_io"
-        project_mount_host = PROJECT_ROOT.resolve()
-        project_mount_container = "/workspace"
-
-        container_config_path = self._prepare_container_training_config(output_mount_container=output_mount_container)
-
-        image_name = str(self.docker_config["image_name"])
-        build_new_image = bool(self.docker_config["build_new_image"])
-        if not build_new_image and not self._docker_image_exists(image_name):
-            build_new_image = True
-        if build_new_image:
-            self._docker_build_image(image_name)
-
-        if bool(self.docker_config["agentic"]):
-            self._run_training_with_code_agent(
-                image_name=image_name,
-                output_mount_host=output_mount_host,
-                output_mount_container=output_mount_container,
-                project_mount_host=project_mount_host,
-                project_mount_container=project_mount_container,
-                script_name=artifacts.train_script_path.name,
-                config_name=container_config_path.name,
-            )
-            return
-
-        run_command = self._build_docker_run_command(
-            image_name=image_name,
-            output_mount_host=output_mount_host,
-            output_mount_container=output_mount_container,
-            project_mount_host=project_mount_host,
-            project_mount_container=project_mount_container,
-            script_name=artifacts.train_script_path.name,
-            config_name=container_config_path.name,
-        )
-        run_result = subprocess.run(run_command, capture_output=True, text=True)
-        if run_result.returncode != 0:
-            stderr = run_result.stderr.strip()
-            stdout = run_result.stdout.strip()
-            details = stderr or stdout or "unknown error"
-            raise RuntimeError(f"Docker training failed: {details}")
-
-    def _prepare_container_training_config(self, *, output_mount_container: str) -> Path:
-        host_config_path = self.output_dir / "training_job_config.json"
-        config_payload = json.loads(host_config_path.read_text(encoding="utf-8"))
-        config_payload["train_path"] = f"{output_mount_container}/{Path(config_payload['train_path']).name}"
-        config_payload["val_path"] = f"{output_mount_container}/{Path(config_payload['val_path']).name}"
-        config_payload["model_path"] = f"{output_mount_container}/{Path(config_payload['model_path']).name}"
-        config_payload["metrics_path"] = f"{output_mount_container}/{Path(config_payload['metrics_path']).name}"
-        container_config_path = self.output_dir / "training_job_config.container.json"
-        container_config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
-        return container_config_path
-
-    def _run_training_with_code_agent(
+    def _run_training_locally_with_code_agent(
         self,
         *,
-        image_name: str,
-        output_mount_host: Path,
-        output_mount_container: str,
-        project_mount_host: Path,
-        project_mount_container: str,
-        script_name: str,
-        config_name: str,
+        artifacts: ActiveLearningArtifacts,
     ) -> None:
         try:
             import httpx
             from smolagents import CodeAgent, OpenAIModel
             from smolagents.agents import RunResult
-            from smolagents.monitoring import AgentLogger, LogLevel
-            from agents.data_collection.smolagents_backend import PrebakedDockerExecutor
+            from agents.tools import build_search_tools
         except Exception as error:  # pragma: no cover - dependency failure fallback
             raise RuntimeError(
-                "Agentic docker training requires smolagents with OpenAI-compatible model support."
+                "Agentic local training requires smolagents with OpenAI-compatible model support."
             ) from error
 
         llm_config = self.config.get("llm", {})
@@ -1042,60 +985,25 @@ class ActiveLearningAgent(BaseAgent):
             temperature=float(llm_config.get("temperature", 0.1)),
             max_tokens=int(llm_config.get("max_tokens", 4000)),
         )
-
-        sandbox_config = llm_config.get("sandbox", {}) if isinstance(llm_config, Mapping) else {}
-        sandbox_mapping = dict(sandbox_config) if isinstance(sandbox_config, Mapping) else {}
-        host = str(self.docker_config.get("host", sandbox_mapping.get("host", "127.0.0.1")))
-        port = int(self.docker_config.get("port", sandbox_mapping.get("port", 8892)))
-
-        container_run_kwargs = {
-            "mem_limit": str(self.docker_config["memory_limit"]),
-            "cpu_quota": int(float(self.docker_config["cpu_limit"]) * 100000),
-            "pids_limit": int(self.docker_config["pids_limit"]),
-            "shm_size": str(self.docker_config["shm_size"]),
-            "volumes": {
-                str(project_mount_host): {"bind": project_mount_container, "mode": "ro"},
-                str(output_mount_host): {"bind": output_mount_container, "mode": "rw"},
-            },
-            "working_dir": project_mount_container,
-            "environment": {"PYTHONPATH": project_mount_container},
-        }
-        dockerfile_content = TRAIN_DOCKERFILE_PATH.read_text(encoding="utf-8")
-
-        executor = PrebakedDockerExecutor(
-            host=host,
-            port=port,
-            image_name=image_name,
-            build_new_image=False,
-            container_run_kwargs=container_run_kwargs,
-            dockerfile_content=dockerfile_content,
-            additional_imports=[
-                "json",
-                "pathlib",
-                "pickle",
-                "numpy",
-                "pandas",
-                "torch",
-            ],
-            logger=AgentLogger(level=LogLevel.ERROR),
-        )
+        config_path = self.output_dir / "training_job_config.json"
+        task_prompt = self._resolve_task_prompt(None) or ""
 
         task = self._build_agentic_training_task(
-            output_mount_container=output_mount_container,
-            script_name=script_name,
-            config_name=config_name,
+            script_path=str(artifacts.train_script_path.resolve()),
+            config_path=str(config_path.resolve()),
+            task_prompt=task_prompt,
         )
+        tools = build_search_tools()
         instructions = (
             "You are a model-training coding agent. "
             "Write robust Python code, run it, inspect runtime outputs, and refine until training succeeds. "
             "You must produce the requested files and end with strict JSON in final_answer."
         )
-        max_steps = int(self.docker_config["max_steps"])
+        max_steps = max(1, int(self.agent_max_steps))
         with CodeAgent(
-            tools=[],
+            tools=tools,
             model=model,
-            executor=executor,
-            executor_type="docker",
+            executor_type="local",
             additional_authorized_imports=[
                 "json",
                 "pathlib",
@@ -1110,92 +1018,51 @@ class ActiveLearningAgent(BaseAgent):
         ) as agent:
             run_result = agent.run(task, max_steps=max_steps, return_full_result=True)
             if not isinstance(run_result, RunResult):
-                raise RuntimeError("Agentic docker training returned an unexpected result type.")
+                raise RuntimeError("Agentic local training returned an unexpected result type.")
+            output_payload = self._parse_agent_output(run_result.output)
+            if output_payload is not None and output_payload.get("success") is False:
+                raise RuntimeError(f"Agentic local training reported failure: {output_payload}")
 
     def _build_agentic_training_task(
         self,
         *,
-        output_mount_container: str,
-        script_name: str,
-        config_name: str,
+        script_path: str,
+        config_path: str,
+        task_prompt: str,
     ) -> str:
-        script_path = f"{output_mount_container}/{script_name}"
-        config_path = f"{output_mount_container}/{config_name}"
+        task_line = task_prompt if task_prompt else "No explicit task prompt provided."
         return (
             "Train an active-learning classifier using the provided config and dataset files.\n"
             f"Config JSON path: {config_path}\n"
             f"Output script path to create/update: {script_path}\n"
+            f"Primary user task_prompt (highest priority): {task_line}\n"
             "Requirements:\n"
             "1) Read config JSON and train a torch-based classifier.\n"
-            "2) Write checkpoint to `model_path` and metrics JSON to `metrics_path` from config.\n"
-            "3) If first implementation fails, debug using errors and rerun.\n"
-            "4) Keep script deterministic with explicit random seeds.\n"
-            "5) Return final JSON with keys: success (bool), model_path, metrics_path, notes.\n"
+            "2) Treat `task_prompt` from config as primary task context and include it in model input construction.\n"
+            "3) Write checkpoint to `model_path` and metrics JSON to `metrics_path` from config.\n"
+            "4) If first implementation fails, debug using errors and rerun.\n"
+            "5) If blocked, use `github_code_search` first and `web_search` second to find reliable training patterns.\n"
+            "6) Keep script deterministic with explicit random seeds.\n"
+            "7) Return final JSON with keys: success (bool), model_path, metrics_path, notes.\n"
             "Use only Python code execution and finish with final_answer(json.dumps(...))."
         )
 
-    def _docker_image_exists(self, image_name: str) -> bool:
-        result = subprocess.run(
-            ["docker", "inspect", "--type=image", image_name],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-
-    def _docker_build_image(self, image_name: str) -> None:
-        build_command = [
-            "docker",
-            "build",
-            "-f",
-            str(TRAIN_DOCKERFILE_PATH),
-            "-t",
-            image_name,
-            str(PROJECT_ROOT),
-        ]
-        result = subprocess.run(build_command, capture_output=True, text=True)
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            stdout = result.stdout.strip()
-            details = stderr or stdout or "unknown error"
-            raise RuntimeError(f"Unable to build Docker image for active learning training: {details}")
-
-    def _build_docker_run_command(
-        self,
-        *,
-        image_name: str,
-        output_mount_host: Path,
-        output_mount_container: str,
-        project_mount_host: Path,
-        project_mount_container: str,
-        script_name: str,
-        config_name: str,
-    ) -> list[str]:
-        return [
-            "docker",
-            "run",
-            "--rm",
-            "--memory",
-            str(self.docker_config["memory_limit"]),
-            "--cpus",
-            str(self.docker_config["cpu_limit"]),
-            "--pids-limit",
-            str(self.docker_config["pids_limit"]),
-            "--shm-size",
-            str(self.docker_config["shm_size"]),
-            "-e",
-            f"PYTHONPATH={project_mount_container}",
-            "-v",
-            f"{project_mount_host}:{project_mount_container}:ro",
-            "-v",
-            f"{output_mount_host}:{output_mount_container}:rw",
-            "-w",
-            project_mount_container,
-            image_name,
-            "python",
-            f"{output_mount_container}/{script_name}",
-            "--config",
-            f"{output_mount_container}/{config_name}",
-        ]
+    @staticmethod
+    def _parse_agent_output(raw_output: Any) -> dict[str, Any] | None:
+        if raw_output is None:
+            return None
+        if isinstance(raw_output, Mapping):
+            return dict(raw_output)
+        text = str(raw_output).strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+        return None
 
     @staticmethod
     def _normalize_api_base(api_base: str) -> str:
@@ -1239,50 +1106,6 @@ class ActiveLearningAgent(BaseAgent):
             return dict(agents_config["active_learning"])
         return {}
 
-    def _resolve_training_config(self) -> dict[str, Any]:
-        training = self.active_config.get("training", {})
-        training_config = dict(training) if isinstance(training, Mapping) else {}
-
-        legacy_model = self.active_config.get("model", {})
-        if isinstance(legacy_model, Mapping):
-            if "embedding_dim" not in training_config and "dim" in legacy_model:
-                training_config["embedding_dim"] = int(legacy_model["dim"])
-            if "epochs" not in training_config and "epochs" in legacy_model:
-                training_config["epochs"] = int(legacy_model["epochs"])
-            if "learning_rate" not in training_config and "learning_rate" in legacy_model:
-                training_config["learning_rate"] = float(legacy_model["learning_rate"])
-
-        return {
-            "embedding_dim": int(training_config.get("embedding_dim", 64)),
-            "epochs": int(training_config.get("epochs", 20)),
-            "batch_size": int(training_config.get("batch_size", 32)),
-            "learning_rate": float(training_config.get("learning_rate", 0.05)),
-            "max_vocab": int(training_config.get("max_vocab", 5000)),
-            "min_token_freq": int(training_config.get("min_token_freq", 1)),
-        }
-
-    def _resolve_docker_config(self) -> dict[str, Any]:
-        docker_config = self.active_config.get("docker", {})
-        resolved = dict(docker_config) if isinstance(docker_config, Mapping) else {}
-
-        llm = self.config.get("llm", {})
-        sandbox = llm.get("sandbox", {}) if isinstance(llm, Mapping) else {}
-        sandbox_map = dict(sandbox) if isinstance(sandbox, Mapping) else {}
-
-        return {
-            "enabled": bool(resolved.get("enabled", True)),
-            "agentic": bool(resolved.get("agentic", True)),
-            "max_steps": int(resolved.get("max_steps", 8)),
-            "image_name": str(resolved.get("image_name", DEFAULT_TRAINING_IMAGE)),
-            "build_new_image": bool(resolved.get("build_new_image", False)),
-            "memory_limit": str(resolved.get("memory_limit", sandbox_map.get("memory_limit", DEFAULT_DOCKER_MEMORY_LIMIT))),
-            "cpu_limit": float(resolved.get("cpu_limit", sandbox_map.get("cpu_limit", DEFAULT_DOCKER_CPU_LIMIT))),
-            "pids_limit": int(resolved.get("pids_limit", sandbox_map.get("pids_limit", DEFAULT_DOCKER_PIDS_LIMIT))),
-            "shm_size": str(resolved.get("shm_size", sandbox_map.get("shm_size", DEFAULT_DOCKER_SHM_SIZE))),
-            "host": str(resolved.get("host", sandbox_map.get("host", "127.0.0.1"))),
-            "port": int(resolved.get("port", sandbox_map.get("port", 8892))),
-        }
-
     def _write_artifacts(
         self,
         enriched: pd.DataFrame,
@@ -1317,8 +1140,14 @@ class ActiveLearningAgent(BaseAgent):
             return frame.copy(), frame.iloc[0:0].copy()
         return train_df, val_df
 
-    def _compose_texts(self, frame: pd.DataFrame, feature_columns: Sequence[str]) -> list[str]:
-        return _compose_texts_from_frame(frame, feature_columns)
+    def _compose_texts(
+        self,
+        frame: pd.DataFrame,
+        feature_columns: Sequence[str],
+        *,
+        task_prompt: str | None = None,
+    ) -> list[str]:
+        return _compose_texts_from_frame(frame, feature_columns, task_prompt=task_prompt)
 
     def _target_labels(self, frame: pd.DataFrame, target_column: str) -> list[str]:
         return [_normalize_label_value(value) for value in frame[target_column].tolist()]

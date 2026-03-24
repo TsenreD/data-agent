@@ -37,7 +37,27 @@ class DummyAnnotationPromptAdapter:
         return result_rows[0]
 
 
-def test_active_learning_agent_selects_prompt_aligned_target_and_queries_pool(tmp_path) -> None:
+def _write_training_outputs(artifacts, *, backend: str = "torch") -> None:
+    checkpoint = {
+        "architecture": "numpy_softmax",
+        "vectorizer": {"token_to_index": {"complete": 1, "incomplete": 2}, "unknown_index": 0},
+        "index_to_label": ["false", "true"],
+        "weights": [[0.0, 0.0], [1.0, -1.0], [-1.0, 1.0]],
+        "bias": [0.0, 0.0],
+    }
+    with Path(artifacts.model_path).open("wb") as handle:
+        pickle.dump(checkpoint, handle)
+    Path(artifacts.training_metrics_path).write_text(
+        (
+            '{"accuracy": 1.0, "macro_f1": 1.0, '
+            '"evaluated_rows": 2, "train_rows": 2, "val_rows": 2, '
+            f'"backend": "{backend}"}}'
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_active_learning_agent_selects_prompt_aligned_target_and_queries_pool(monkeypatch, tmp_path) -> None:
     output_dir = tmp_path / "data"
     frame = pd.DataFrame(
         {
@@ -72,12 +92,12 @@ def test_active_learning_agent_selects_prompt_aligned_target_and_queries_pool(tm
                     "task_prompt": "Train classification model to determine whether text contains a full problem, or an incomplete one",
                     "batch_size": 2,
                     "model": {"epochs": 18, "dim": 32, "bucket_size": 2048},
-                    "docker": {"enabled": False},
                 }
             }
         },
         output_dir=output_dir,
     )
+    monkeypatch.setattr(agent, "_run_training_locally_with_code_agent", lambda **kwargs: _write_training_outputs(kwargs["artifacts"]))
 
     result = agent.execute({"dataframe": frame})
 
@@ -106,7 +126,6 @@ def test_active_learning_run_cycle_and_report(tmp_path) -> None:
                     "task_prompt": "Classify whether a text is complete or incomplete",
                     "batch_size": 2,
                     "model": {"epochs": 20, "dim": 24, "bucket_size": 1024},
-                    "docker": {"enabled": False},
                 }
             }
         },
@@ -179,7 +198,6 @@ def test_active_learning_integrates_after_annotation_prompt(monkeypatch, tmp_pat
                     "feature_columns": ["text"],
                     "target_column": "label",
                     "model": {"epochs": 16, "dim": 24, "bucket_size": 1024},
-                    "docker": {"enabled": False},
                 },
             },
         },
@@ -187,6 +205,7 @@ def test_active_learning_integrates_after_annotation_prompt(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(annotation, "_build_model_adapter", lambda: DummyAnnotationPromptAdapter())
     active = ActiveLearningAgent(config=annotation.config, output_dir=output_dir)
+    monkeypatch.setattr(active, "_run_training_locally_with_code_agent", lambda **kwargs: _write_training_outputs(kwargs["artifacts"]))
 
     runner = PipelineRunner([annotation, active])
     result = runner.run({"dataframe": frame})
@@ -197,7 +216,7 @@ def test_active_learning_integrates_after_annotation_prompt(monkeypatch, tmp_pat
     assert Path(result.artifacts["active_learning_model"]).exists()
 
 
-def test_active_learning_prefers_docker_training_when_enabled(monkeypatch, tmp_path) -> None:
+def test_active_learning_trains_only_via_codeagent_execution(monkeypatch, tmp_path) -> None:
     frame = pd.DataFrame(
         {
             "text": [
@@ -217,17 +236,20 @@ def test_active_learning_prefers_docker_training_when_enabled(monkeypatch, tmp_p
                     "feature_columns": ["text"],
                     "target_column": "is_complete",
                     "batch_size": 2,
-                    "docker": {"enabled": True},
+                    "max_steps": 5,
                 }
             }
         },
         output_dir=tmp_path / "data",
     )
 
-    calls = {"docker": 0, "local": 0}
+    calls = {"codeagent": 0}
 
-    def fake_docker_training(artifacts):
-        calls["docker"] += 1
+    def fake_codeagent_training(*, artifacts):
+        calls["codeagent"] += 1
+        output_dir = Path(artifacts.train_script_path).parent
+        model_path = output_dir / "model.pth"
+        metrics_path = output_dir / "training_metrics.json"
         checkpoint = {
             "architecture": "numpy_softmax",
             "vectorizer": {"token_to_index": {"complete": 1, "incomplete": 2}, "unknown_index": 0},
@@ -235,21 +257,15 @@ def test_active_learning_prefers_docker_training_when_enabled(monkeypatch, tmp_p
             "weights": [[0.0, 0.0], [1.0, -1.0], [-1.0, 1.0]],
             "bias": [0.0, 0.0],
         }
-        with Path(artifacts.model_path).open("wb") as handle:
+        with model_path.open("wb") as handle:
             pickle.dump(checkpoint, handle)
-        Path(artifacts.training_metrics_path).write_text(
+        metrics_path.write_text(
             '{"accuracy": 1.0, "macro_f1": 1.0, "evaluated_rows": 2, "train_rows": 2, "val_rows": 2, "backend": "torch"}',
             encoding="utf-8",
         )
 
-    def fail_local_training(_):
-        calls["local"] += 1
-        raise AssertionError("local training should not be used when docker is enabled")
-
-    monkeypatch.setattr(agent, "_run_training_in_docker", fake_docker_training)
-    monkeypatch.setattr(agent, "_run_training_locally", fail_local_training)
+    monkeypatch.setattr(agent, "_run_training_locally_with_code_agent", fake_codeagent_training)
 
     result = agent.execute({"dataframe": frame})
-    assert calls["docker"] == 1
-    assert calls["local"] == 0
+    assert calls["codeagent"] == 1
     assert result.metadata["active_learning"]["metrics"]["backend"] == "torch"

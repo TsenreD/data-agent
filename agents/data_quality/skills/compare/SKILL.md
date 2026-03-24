@@ -15,7 +15,7 @@ Load the before and after datasets with Python code and return a concise JSON co
 
 ## Runtime
 
-- Your Python runs inside the lightweight Docker sandbox.
+- Your Python runs inside the lightweight local execution runtime.
 - Imports are limited to the approved EDA-oriented modules provided by the host.
 - Do not use tools.
 - Do not use shell commands, `subprocess`, or arbitrary filesystem writes.
@@ -44,7 +44,7 @@ If the analysis context includes multiple candidate strategies or a declared “
 
 ## Comparison Rules
 
-- Load both datasets from the provided sandbox paths before answering.
+- Load both datasets from the provided local paths before answering.
 - Compute quality metrics from actual data, not from host-provided summaries.
 - Use the same style of duplicate / outlier logic across before and after so the comparison is fair.
 - Prefer one end-to-end code block that computes the comparison and returns `final_answer(...)`.

@@ -15,7 +15,7 @@ def test_quality_backend_builds_detect_task_with_dataset_paths() -> None:
         preview_frame=pd.DataFrame({"text": ["sample"], "label": [1]}),
     )
 
-    assert "Sandbox dataset path:" in task
+    assert "Local dataset path:" in task
     assert "Primary modality: text" in task
     assert "Preferred label column: label" in task
     assert "Imbalance threshold: 0.75" in task
@@ -36,7 +36,7 @@ def test_quality_backend_builds_fix_task_with_strategy_and_output_path(tmp_path)
         imbalance_threshold=0.8,
     )
 
-    assert "Sandbox output dataset path:" in task
+    assert "Local output dataset path:" in task
     assert '"missing": "median"' in task
     assert "Task description: classification" in task
     assert "Task-aware analysis context:" in task

@@ -204,7 +204,7 @@ def test_inspect_dataset_uses_empty_tool_list(monkeypatch, tmp_path) -> None:
     backend = SmolagentsNotebookBackend(model=object())
     monkeypatch.setattr(
         backend,
-        "_run_python_in_eda_sandbox",
+        "_run_python_locally",
         lambda **kwargs: '{"summary":{"row_count":1,"columns":["text"]},"notes":["saw text"]}',
     )
     result = backend.inspect_dataset(tmp_path / "data" / "unified_dataset.jsonl")
@@ -219,16 +219,14 @@ def test_run_inspection_script_summarizes_text_lengths_without_word_content(monk
 
     backend = SmolagentsNotebookBackend(model=object())
 
-    def fake_run_python_in_eda_sandbox(**kwargs):
+    def fake_run_python_locally(**kwargs):
         captured["script"] = kwargs["script"]
         return '{"summary":{"row_count":1},"notes":[]}'
 
-    monkeypatch.setattr(backend, "_run_python_in_eda_sandbox", fake_run_python_in_eda_sandbox)
+    monkeypatch.setattr(backend, "_run_python_locally", fake_run_python_locally)
 
     backend._run_inspection_script(
         dataset_path=tmp_path / "data" / "unified_dataset.jsonl",
-        mount_host_path=tmp_path,
-        mount_container_path="/workspace",
     )
 
     script = captured["script"]

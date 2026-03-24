@@ -15,7 +15,7 @@ Look at the real dataset, the detected issue report, and the project/task contex
 
 ## Runtime
 
-- Your Python runs inside the lightweight Docker sandbox.
+- Your Python runs inside the lightweight local execution runtime.
 - Imports are limited to the approved EDA-oriented modules provided by the host.
 - Do not use tools.
 - Do not use shell commands, `subprocess`, or arbitrary filesystem writes.
@@ -48,7 +48,7 @@ The `recommended_strategy` may contain modality-specific action blocks such as:
 
 ## Task Interpretation Rules
 
-- Load the dataset from the provided sandbox path before making conclusions.
+- Load the dataset from the provided local path before making conclusions.
 - Use the provided preview/schema context to reduce unnecessary exploration.
 - Do not spend a step on print-only debugging. Your first code block should aim to return the final JSON.
 - Use the project/task context and the actual rows together.

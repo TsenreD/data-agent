@@ -22,19 +22,6 @@ llm:
   api_key: empty
   github_token: 
 
-  # Docker sandbox resource limits for CodeAgent
-  sandbox:
-    memory_limit: "4g"
-    cpu_limit: 2
-    shm_size: "4g"
-    pids_limit: 200
-
-  eda_sandbox:
-    memory_limit: "4g"
-    cpu_limit: 2
-    shm_size: "4g"
-    pids_limit: 200
-
 agents:
   collection:
     max_steps: 25
@@ -70,23 +57,8 @@ agents:
       - text
     strategy: entropy
     batch_size: 20
+    max_steps: 8
     test_size: 0.25
-    model:
-      dim: 64
-      bucket_size: 8192
-      min_n: 3
-      max_n: 6
-      learning_rate: 0.05
-      epochs: 25
-    docker:
-      enabled: true
-      agentic: true
-      max_steps: 8
-      image_name: data-agent-active-learning-train
-      memory_limit: "16g"
-      cpu_limit: 8
-      pids_limit: 2048
-      shm_size: "8g"
 
 
 sources:

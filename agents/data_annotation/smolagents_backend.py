@@ -7,10 +7,8 @@ from typing import Any, Callable, Mapping, Sequence
 import pandas as pd
 
 from agents.data_collection.smolagents_backend import (
-    EDA_DOCKERFILE_PATH,
     EDA_NOTEBOOK_IMPORTS,
-    PROJECT_ROOT,
-    _SmolagentsDockerBackendBase,
+    _SmolagentsLocalBackendBase,
     _parse_json_payload,
 )
 
@@ -37,40 +35,14 @@ class ParserResult:
     notes: list[str] = field(default_factory=list)
 
 
-class _AnnotationEdaBackend(_SmolagentsDockerBackendBase):
+class _AnnotationEdaBackend(_SmolagentsLocalBackendBase):
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
         agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
     ) -> None:
-        super().__init__(
-            llm_config=llm_config,
-            agent_config=agent_config,
-            model=model,
-            sandbox_key="eda_sandbox",
-            dockerfile_path=EDA_DOCKERFILE_PATH,
-            default_image_name="data-agent-eda-sandbox",
-            default_port=8890,
-        )
-
-    def _build_container_run_kwargs(
-        self,
-        source: Mapping[str, Any],
-        sandbox_config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        container_run_kwargs = super()._build_container_run_kwargs(source, sandbox_config)
-        mount_host_path = str(source.get("mount_host_path") or PROJECT_ROOT)
-        mount_container_path = str(source.get("mount_container_path") or "/workspace")
-        mode = str(source.get("mount_mode", "ro"))
-        volumes = container_run_kwargs.get("volumes", {})
-        volumes[mount_host_path] = {"bind": mount_container_path, "mode": mode}
-        container_run_kwargs["volumes"] = volumes
-        container_run_kwargs["working_dir"] = "/workspace"
-        environment = dict(container_run_kwargs.get("environment", {}))
-        environment.setdefault("MPLCONFIGDIR", "/tmp/mpl")
-        container_run_kwargs["environment"] = environment
-        return container_run_kwargs
+        super().__init__(llm_config=llm_config, agent_config=agent_config, model=model)
 
     def _run_json_skill(
         self,
@@ -155,25 +127,6 @@ class _AnnotationEdaBackend(_SmolagentsDockerBackendBase):
             lines.append(f"{prefix} attempt {attempt['attempt']} notes: " + " | ".join(str(note) for note in notes))
         return lines
 
-    @staticmethod
-    def _mount_host_path(*paths: Path) -> Path:
-        resolved_paths = [path.resolve() for path in paths]
-        project_root = PROJECT_ROOT.resolve()
-        if all(path.is_relative_to(project_root) for path in resolved_paths):
-            return PROJECT_ROOT
-        common = Path(resolved_paths[0]).parent
-        return common
-
-    @staticmethod
-    def _sandbox_dataset_path(dataset_path: Path) -> str:
-        resolved_dataset_path = dataset_path.resolve()
-        resolved_project_root = PROJECT_ROOT.resolve()
-        if resolved_dataset_path.is_relative_to(resolved_project_root):
-            relative_path = resolved_dataset_path.relative_to(resolved_project_root)
-            return (Path("/workspace") / relative_path).as_posix()
-        return (Path("/workspace/input") / resolved_dataset_path.name).as_posix()
-
-
 class SmolagentsAnnotationBackend(_AnnotationEdaBackend):
     def __init__(
         self,
@@ -198,7 +151,7 @@ class SmolagentsAnnotationBackend(_AnnotationEdaBackend):
             result_type=AnnotationSetupResult,
             failure_kwargs={"columns": [], "examples": []},
             log_prefix="annotation setup",
-            source={"mount_host_path": str(PROJECT_ROOT), "mount_mode": "ro"},
+            source={},
             max_steps=int(self.agent_config.get("max_steps", 6)),
             max_attempts=int(self.agent_config.get("max_attempts", 2)),
         )

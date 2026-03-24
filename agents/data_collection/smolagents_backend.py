@@ -4,9 +4,9 @@ import json
 import os
 import re
 import signal
-import socket
+import subprocess
+import sys
 from dataclasses import dataclass, field
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,8 +15,6 @@ import pandas as pd
 from smolagents import CodeAgent, InferenceClientModel, OpenAIModel
 from smolagents.agents import RunResult
 from smolagents.local_python_executor import BASE_BUILTIN_MODULES
-from smolagents.monitoring import AgentLogger, LogLevel
-from smolagents.remote_executors import DockerExecutor
 
 from agents.tools import build_search_tools
 
@@ -25,12 +23,6 @@ from .skillset import load_skill
 
 JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile.parse")
-EDA_DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile.eda")
-DEFAULT_SANDBOX_MEMORY_LIMIT = "512m"
-DEFAULT_SANDBOX_SHM_SIZE = "1g"
-DEFAULT_SANDBOX_CPU_LIMIT = 0.5
-DEFAULT_SANDBOX_PIDS_LIMIT = 100
 LOCALHOST_NO_PROXY = "127.0.0.1,localhost"
 AUTHORIZED_IMPORTS = [
     "aiohttp",
@@ -208,37 +200,16 @@ class DatasetInspectionResult:
     notes: list[str] = field(default_factory=list)
 
 
-class PrebakedDockerExecutor(DockerExecutor):
-    """Docker executor that relies on the image contents instead of runtime pip installs."""
-
-    def install_packages(self, additional_imports: list[str]) -> list[str]:
-        if additional_imports and hasattr(self, "logger"):
-            self.logger.log(
-                "Skipping runtime package installation; relying on preinstalled sandbox packages.",
-                level=LogLevel.INFO,
-            )
-        return list(additional_imports)
-
-
-class _SmolagentsDockerBackendBase:
+class _SmolagentsLocalBackendBase:
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
         agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
-        *,
-        sandbox_key: str = "sandbox",
-        dockerfile_path: Path = DOCKERFILE_PATH,
-        default_image_name: str = "data-agent-smolagents-sandbox",
-        default_port: int = 8888,
     ) -> None:
         self.llm_config = dict(llm_config or {})
         self.agent_config = dict(agent_config or {})
         self.model = model or self._build_model(self.llm_config)
-        self.sandbox_key = sandbox_key
-        self.dockerfile_path = dockerfile_path
-        self.default_image_name = default_image_name
-        self.default_port = default_port
 
     def _build_model(self, llm_config: Mapping[str, Any]) -> Any:
         provider = str(llm_config.get("provider", "openai_compatible")).lower()
@@ -272,46 +243,6 @@ class _SmolagentsDockerBackendBase:
             max_tokens=int(llm_config.get("max_tokens", 4000)),
         )
 
-    def _build_executor_kwargs(self, source: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        source = source or {}
-        sandbox_config = dict(self.llm_config.get(self.sandbox_key, {}))
-        container_run_kwargs = self._build_container_run_kwargs(source, sandbox_config)
-
-        return {
-            "host": str(sandbox_config.get("host", "127.0.0.1")),
-            "port": int(sandbox_config.get("port", self.default_port)),
-            "image_name": str(sandbox_config.get("image_name", self.default_image_name)),
-            "build_new_image": bool(sandbox_config.get("build_new_image", False)),
-            "container_run_kwargs": container_run_kwargs,
-            "dockerfile_content": self._load_dockerfile_content(),
-        }
-
-    def _build_container_run_kwargs(
-        self,
-        source: Mapping[str, Any],
-        sandbox_config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        container_run_kwargs = {
-            **self._build_resource_limits(sandbox_config),
-            "security_opt": ["no-new-privileges"],
-            "cap_drop": ["ALL"],
-            "environment": self._build_container_env(),
-        }
-        if source.get("allow_network") is False:
-            container_run_kwargs["network_disabled"] = True
-        return container_run_kwargs
-
-    @staticmethod
-    def _build_resource_limits(sandbox_config: Mapping[str, Any]) -> dict[str, Any]:
-        cpu_limit = float(sandbox_config.get("cpu_limit", DEFAULT_SANDBOX_CPU_LIMIT))
-        return {
-            "mem_limit": str(sandbox_config.get("memory_limit", DEFAULT_SANDBOX_MEMORY_LIMIT)),
-            "cpu_quota": int(cpu_limit * 100000),
-            "pids_limit": int(sandbox_config.get("pids_limit", DEFAULT_SANDBOX_PIDS_LIMIT)),
-            # Chrome and Chromium routinely crash in Docker with the default 64 MB /dev/shm.
-            "shm_size": str(sandbox_config.get("shm_size", DEFAULT_SANDBOX_SHM_SIZE)),
-        }
-
     def _run_agent(
         self,
         *,
@@ -323,37 +254,28 @@ class _SmolagentsDockerBackendBase:
         source: Mapping[str, Any] | None = None,
         execution_timeout_seconds: int | None = None,
     ) -> RunResult:
-        logger = AgentLogger(level=LogLevel.ERROR)
-        with _localhost_proxy_bypass():
-            executor_kwargs = self._build_executor_kwargs(source)
-            executor_kwargs["port"] = self._resolve_executor_port(executor_kwargs["port"])
-            executor = PrebakedDockerExecutor(
-                additional_imports=additional_imports,
-                logger=logger,
-                **executor_kwargs,
+        source = source or {}
+        local_task = task
+        if source.get("allow_network") is False:
+            local_task = (
+                f"{task}\n\n"
+                "Execution policy: best-effort local no-network mode. "
+                "Do not call external URLs, remote APIs, or network tools in generated code."
             )
+        with _localhost_proxy_bypass():
             with CodeAgent(
                 tools=tools,
                 model=self.model,
-                executor=executor,
-                executor_type="docker",
+                executor_type="local",
                 additional_authorized_imports=additional_imports,
                 max_steps=max_steps,
                 verbosity_level=1,
                 instructions=instructions,
             ) as agent:
                 with _agent_run_timeout(execution_timeout_seconds):
-                    run_result = agent.run(task, max_steps=max_steps, return_full_result=True)
+                    run_result = agent.run(local_task, max_steps=max_steps, return_full_result=True)
         assert isinstance(run_result, RunResult)
         return run_result
-
-    def _resolve_executor_port(self, desired_port: int) -> int:
-        sandbox_config = dict(self.llm_config.get(self.sandbox_key, {}))
-        if sandbox_config.get("port") is not None:
-            return desired_port
-        if _is_local_port_free("127.0.0.1", desired_port):
-            return desired_port
-        return _find_free_local_port()
 
     @staticmethod
     def _normalize_api_base(api_base: str) -> str:
@@ -362,63 +284,16 @@ class _SmolagentsDockerBackendBase:
             return normalized[: -len("/chat/completions")]
         return normalized
 
-    def _build_container_env(self) -> dict[str, str]:
-        environment: dict[str, str] = {}
-        hf_token = self.llm_config.get("hf_token") or self.llm_config.get("api_key") or os.getenv("HF_TOKEN")
-        if hf_token:
-            environment["HF_TOKEN"] = str(hf_token)
-
-        github_config = self.llm_config.get("github", {})
-        github_token = None
-        if isinstance(github_config, Mapping):
-            github_token = github_config.get("token") or github_config.get("api_key")
-        github_token = (
-            github_token
-            or self.llm_config.get("github_token")
-            or self.llm_config.get("gh_token")
-            or os.getenv("GITHUB_TOKEN")
-            or os.getenv("GH_TOKEN")
-        )
-        if github_token:
-            environment["GITHUB_TOKEN"] = str(github_token)
-        return environment
-
-    def _load_dockerfile_content(self) -> str:
-        return self.dockerfile_path.read_text(encoding="utf-8")
-
-
-class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
+class SmolagentsCollectionBackend(_SmolagentsLocalBackendBase):
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
         agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
     ) -> None:
-        super().__init__(
-            llm_config=llm_config,
-            agent_config=agent_config,
-            model=model,
-            sandbox_key="sandbox",
-            dockerfile_path=DOCKERFILE_PATH,
-            default_image_name="data-agent-smolagents-sandbox",
-            default_port=8888,
-        )
+        super().__init__(llm_config=llm_config, agent_config=agent_config, model=model)
         self.tools = build_search_tools()
         self.instructions = load_skill("data_collection")
-
-    def _build_container_run_kwargs(
-        self,
-        source: Mapping[str, Any],
-        sandbox_config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        container_run_kwargs = super()._build_container_run_kwargs(source, sandbox_config)
-        mount_host_path = str(source.get("mount_host_path") or PROJECT_ROOT)
-        mount_container_path = str(source.get("mount_container_path") or "/workspace")
-        volumes = container_run_kwargs.get("volumes", {})
-        volumes[mount_host_path] = {"bind": mount_container_path, "mode": "ro"}
-        container_run_kwargs["volumes"] = volumes
-        container_run_kwargs["working_dir"] = "/workspace"
-        return container_run_kwargs
 
     def collect(self, source: Mapping[str, Any]) -> SmolagentsCollectionResult:
         source_type = str(source["type"])
@@ -630,41 +505,16 @@ class SmolagentsCollectionBackend(_SmolagentsDockerBackendBase):
         return str(source.get("name") or source.get("url") or source.get("endpoint") or source["type"])
 
 
-class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
+class SmolagentsNotebookBackend(_SmolagentsLocalBackendBase):
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
         agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
     ) -> None:
-        super().__init__(
-            llm_config=llm_config,
-            agent_config=agent_config,
-            model=model,
-            sandbox_key="eda_sandbox",
-            dockerfile_path=EDA_DOCKERFILE_PATH,
-            default_image_name="data-agent-eda-sandbox",
-            default_port=8890,
-        )
+        super().__init__(llm_config=llm_config, agent_config=agent_config, model=model)
         self.inspection_instructions = load_skill("eda_inspection")
         self.instructions = load_skill("eda_notebook")
-
-    def _build_container_run_kwargs(
-        self,
-        source: Mapping[str, Any],
-        sandbox_config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        container_run_kwargs = super()._build_container_run_kwargs(source, sandbox_config)
-        mount_host_path = str(source.get("mount_host_path") or PROJECT_ROOT)
-        mount_container_path = str(source.get("mount_container_path") or "/workspace")
-        volumes = container_run_kwargs.get("volumes", {})
-        volumes[mount_host_path] = {"bind": mount_container_path, "mode": "rw"}
-        container_run_kwargs["volumes"] = volumes
-        container_run_kwargs["working_dir"] = "/workspace"
-        environment = dict(container_run_kwargs.get("environment", {}))
-        environment.setdefault("MPLCONFIGDIR", "/tmp/mpl")
-        container_run_kwargs["environment"] = environment
-        return container_run_kwargs
 
     def generate_notebook(
         self,
@@ -762,7 +612,6 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
 
     def inspect_dataset(self, dataset_path: str | Path) -> DatasetInspectionResult:
         dataset_path = Path(dataset_path)
-        mount_host_path, mount_container_path, sandbox_dataset_path = self._sandbox_mount(dataset_path)
         logs: list[str] = []
         attempts: list[dict[str, Any]] = []
         max_attempts = max(1, int(self.agent_config.get("inspection_max_attempts", 1)))
@@ -771,8 +620,6 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
             try:
                 raw_output = self._run_inspection_script(
                     dataset_path=dataset_path,
-                    mount_host_path=mount_host_path,
-                    mount_container_path=mount_container_path,
                 )
                 summary, notes = self._parse_inspection_output(raw_output)
                 attempt = {
@@ -864,12 +711,12 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
             "Prefer a straightforward 5-7 cell notebook and never exceed 10 cells."
         )
 
-    def _build_inspection_task(self, dataset_path: Path, sandbox_dataset_path: str) -> str:
+    def _build_inspection_task(self, dataset_path: Path, local_dataset_path: str) -> str:
         return (
             "Inspect the unified dataset and return a concise JSON summary of the real data.\n"
             f"Host dataset path: {dataset_path.as_posix()}\n"
-            f"Sandbox dataset path: {sandbox_dataset_path}\n"
-            "Load the dataset from the sandbox path with pandas and inspect the real rows and columns before answering.\n"
+            f"Local dataset path: {local_dataset_path}\n"
+            "Load the dataset from the local path with pandas and inspect the real rows and columns before answering.\n"
             "Return the final answer as a JSON string with top-level fields `summary` and optional `notes`.\n"
             "Keep `summary` compact, factual, and JSON-serializable."
         )
@@ -878,17 +725,15 @@ class SmolagentsNotebookBackend(_SmolagentsDockerBackendBase):
         self,
         *,
         dataset_path: Path,
-        mount_host_path: Path,
-        mount_container_path: str,
     ) -> str:
-        sandbox_dataset_path = self._sandbox_dataset_path(dataset_path)
+        local_dataset_path = str(dataset_path.resolve())
         script = f"""
 import json
 from collections import Counter
 
 import pandas as pd
 
-df = pd.read_json({sandbox_dataset_path!r}, lines=True)
+df = pd.read_json({local_dataset_path!r}, lines=True)
 summary = {{
     "row_count": int(len(df)),
     "columns": list(df.columns),
@@ -942,65 +787,32 @@ summary["recommended_sections"] = list(dict.fromkeys(recommended_sections))
 payload = {{
     "summary": summary,
     "notes": [
-        "Inspected the real dataset inside the lightweight EDA sandbox.",
+        "Inspected the real dataset via local Python execution.",
         "Summary is based on executed pandas inspection rather than static host assumptions.",
     ],
 }}
 print(json.dumps(payload, ensure_ascii=False))
 """
-        return self._run_python_in_eda_sandbox(
-            script=script,
-            mount_host_path=mount_host_path,
-            mount_container_path=mount_container_path,
-        )
+        return self._run_python_locally(script=script)
 
-    def _run_python_in_eda_sandbox(
+    def _run_python_locally(
         self,
         *,
         script: str,
-        mount_host_path: Path,
-        mount_container_path: str,
     ) -> str:
-        import docker
-
-        sandbox_config = dict(self.llm_config.get(self.sandbox_key, {}))
-        image_name = str(sandbox_config.get("image_name", self.default_image_name))
-        build_new_image = bool(sandbox_config.get("build_new_image", False))
-        client = docker.from_env()
-
-        if not build_new_image:
-            try:
-                client.images.get(image_name)
-            except docker.errors.ImageNotFound:
-                build_new_image = True
-
-        if build_new_image:
-            dockerfile_obj = BytesIO(self._load_dockerfile_content().encode("utf-8"))
-            client.images.build(fileobj=dockerfile_obj, tag=image_name)
-
-        environment = self._build_container_env()
-        environment.setdefault("MPLCONFIGDIR", "/tmp/mpl")
-
-        try:
-            output = client.containers.run(
-                image_name,
-                command=["python3", "-c", script],
-                remove=True,
-                working_dir="/workspace",
-                volumes={str(mount_host_path): {"bind": mount_container_path, "mode": "rw"}},
-                environment=environment,
-                **self._build_resource_limits(sandbox_config),
-                security_opt=["no-new-privileges"],
-                cap_drop=["ALL"],
-                network_disabled=bool(sandbox_config.get("disable_network", True)),
-            )
-        except docker.errors.ContainerError as error:
-            stderr = error.stderr.decode("utf-8", errors="replace") if error.stderr else str(error)
-            raise RuntimeError(f"EDA sandbox inspection failed: {stderr}") from error
-        except docker.errors.DockerException as error:
-            raise RuntimeError(f"EDA sandbox inspection failed: {error}") from error
-
-        return output.decode("utf-8", errors="replace")
+        env = os.environ.copy()
+        env.setdefault("MPLCONFIGDIR", "/tmp/mpl")
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(PROJECT_ROOT),
+        )
+        if result.returncode != 0:
+            details = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise RuntimeError(f"Local EDA inspection failed: {details}")
+        return result.stdout
 
     def _build_attempt_task(
         self,
@@ -1199,22 +1011,6 @@ print(json.dumps(payload, ensure_ascii=False))
             )
         return lines
 
-    @staticmethod
-    def _sandbox_dataset_path(dataset_path: Path) -> str:
-        return SmolagentsNotebookBackend._sandbox_mount(dataset_path)[2]
-
-    @staticmethod
-    def _sandbox_mount(dataset_path: Path) -> tuple[Path, str, str]:
-        resolved_dataset_path = dataset_path.resolve()
-        resolved_project_root = PROJECT_ROOT.resolve()
-        if resolved_dataset_path.is_relative_to(resolved_project_root):
-            relative_path = resolved_dataset_path.relative_to(resolved_project_root)
-            return PROJECT_ROOT, "/workspace", (Path("/workspace") / relative_path).as_posix()
-        mount_host_path = resolved_dataset_path.parent
-        mount_container_path = "/workspace/input"
-        return mount_host_path, mount_container_path, (Path(mount_container_path) / resolved_dataset_path.name).as_posix()
-
-
 def _parse_json_payload(raw_output: Any) -> Any:
     if isinstance(raw_output, (dict, list)):
         return raw_output
@@ -1269,16 +1065,6 @@ def _merge_no_proxy_values(existing: str | None, required: str) -> str:
     return ",".join(values)
 
 
-def _is_local_port_free(host: str, port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind((host, port))
-        except OSError:
-            return False
-    return True
-
-
 @contextmanager
 def _agent_run_timeout(timeout_seconds: int | None):
     if timeout_seconds is None or timeout_seconds <= 0:
@@ -1309,13 +1095,6 @@ def _agent_run_timeout(timeout_seconds: int | None):
             signal.signal(signal.SIGALRM, previous_handler)
         except Exception:
             pass
-
-
-def _find_free_local_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
 
 def _coerce_record(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):

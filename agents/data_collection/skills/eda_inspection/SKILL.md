@@ -1,6 +1,6 @@
 ---
 name: eda-inspection
-description: Inspect the unified dataset inside the lightweight EDA sandbox by running Python code first, then return a concise JSON summary of the real data characteristics.
+description: Inspect the unified dataset in local execution by running Python code first, then return a concise JSON summary of the real data characteristics.
 ---
 
 # EDA Inspection
@@ -21,7 +21,7 @@ Read the real dataset with Python code and return a concise JSON summary of what
 
 ## Inspection Rules
 
-- Load the dataset from the sandbox dataset path provided in the task.
+- Load the dataset from the local dataset path provided in the task.
 - Use Python code to inspect the real dataframe before forming conclusions.
 - Keep the summary compact and JSON-serializable.
 - Do not write files, use shell commands, or use `subprocess`.

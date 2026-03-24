@@ -5,14 +5,7 @@
     "text"
   ],
   "target_column": "label",
-  "training": {
-    "embedding_dim": 64,
-    "epochs": 25,
-    "batch_size": 32,
-    "learning_rate": 0.05,
-    "max_vocab": 5000,
-    "min_token_freq": 1
-  },
+  "task_prompt": "Train classification model to determine whether text contains a full problem, or an incomplete one.\nUse fasttext as base model, train a classification head on top.",
   "random_seed": 13,
   "model_path": "data/active_learning/model.pth",
   "metrics_path": "data/active_learning/training_metrics.json"

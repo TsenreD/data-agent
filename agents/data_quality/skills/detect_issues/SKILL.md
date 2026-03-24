@@ -1,6 +1,6 @@
 ---
 name: quality-detect-issues
-description: Inspect a real dataset inside the sandbox by writing Python code, then return a strict JSON data quality report that is led by the dataset modality and task, while still covering missingness, duplicates, outliers, and class imbalance.
+description: Inspect a real dataset locally by writing Python code, then return a strict JSON data quality report that is led by the dataset modality and task, while still covering missingness, duplicates, outliers, and class imbalance.
 ---
 
 # Data Quality Detection
@@ -15,7 +15,7 @@ Load the real dataset with Python code, inspect it, and return a compact JSON qu
 
 ## Runtime
 
-- Your Python runs inside the lightweight Docker sandbox.
+- Your Python runs inside the lightweight local execution runtime.
 - Imports are limited to the approved EDA-oriented modules provided by the host.
 - Do not use tools.
 - Do not use shell commands, `subprocess`, or arbitrary filesystem writes.
@@ -51,7 +51,7 @@ Also include short notes about whether each issue is likely meaningful for the t
 
 ## Analysis Rules
 
-- Load the dataset from the provided sandbox path before making conclusions.
+- Load the dataset from the provided local path before making conclusions.
 - Prefer one end-to-end code block that computes the report and returns `final_answer(...)` directly.
 - Do not waste steps on exploratory `print()` debugging unless a failure forces it.
 - Detect missing values from actual nulls and common textual null sentinels when reasonable.

@@ -15,7 +15,7 @@ Load the real dataset, apply the requested cleaning strategy with Python code, w
 
 ## Runtime
 
-- Your Python runs inside the lightweight Docker sandbox.
+- Your Python runs inside the lightweight local execution runtime.
 - Imports are limited to the approved EDA-oriented modules provided by the host.
 - Do not use tools.
 - Do not use shell commands, `subprocess`, or arbitrary filesystem writes outside the provided output path.
@@ -32,8 +32,8 @@ Load the real dataset, apply the requested cleaning strategy with Python code, w
 
 ## Cleaning Rules
 
-- Load the dataset from the provided sandbox input path.
-- Write the cleaned dataset to the provided sandbox output path as JSON Lines.
+- Load the dataset from the provided local input path.
+- Write the cleaned dataset to the provided local output path as JSON Lines.
 - Apply the requested strategy directly in Python instead of describing what you would do.
 - Prefer one end-to-end code block that loads, cleans, writes, and returns `final_answer(...)`.
 - Do not spend steps on exploratory prints or intermediate debugging unless execution fails.

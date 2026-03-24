@@ -1,14 +1,11 @@
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from agents.data_collection.smolagents_backend import (
-    EDA_DOCKERFILE_PATH,
     EDA_NOTEBOOK_IMPORTS,
-    PROJECT_ROOT,
-    _SmolagentsDockerBackendBase,
+    _SmolagentsLocalBackendBase,
     _parse_json_payload,
 )
 
@@ -53,43 +50,18 @@ class QualityAnalysisResult:
     notes: list[str] = field(default_factory=list)
 
 
-class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
+class SmolagentsQualityBackend(_SmolagentsLocalBackendBase):
     def __init__(
         self,
         llm_config: Mapping[str, Any] | None = None,
         agent_config: Mapping[str, Any] | None = None,
         model: Any | None = None,
     ) -> None:
-        super().__init__(
-            llm_config=llm_config,
-            agent_config=agent_config,
-            model=model,
-            sandbox_key="eda_sandbox",
-            dockerfile_path=EDA_DOCKERFILE_PATH,
-            default_image_name="data-agent-eda-sandbox",
-            default_port=8890,
-        )
+        super().__init__(llm_config=llm_config, agent_config=agent_config, model=model)
         self.analyze_instructions = load_skill("analyze")
         self.detect_instructions = load_skill("detect_issues")
         self.fix_instructions = load_skill("fix")
         self.compare_instructions = load_skill("compare")
-
-    def _build_container_run_kwargs(
-        self,
-        source: Mapping[str, Any],
-        sandbox_config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        container_run_kwargs = super()._build_container_run_kwargs(source, sandbox_config)
-        mount_host_path = str(source.get("mount_host_path") or PROJECT_ROOT)
-        mount_container_path = str(source.get("mount_container_path") or "/workspace")
-        volumes = container_run_kwargs.get("volumes", {})
-        volumes[mount_host_path] = {"bind": mount_container_path, "mode": "rw"}
-        container_run_kwargs["volumes"] = volumes
-        container_run_kwargs["working_dir"] = "/workspace"
-        environment = dict(container_run_kwargs.get("environment", {}))
-        environment.setdefault("MPLCONFIGDIR", "/tmp/mpl")
-        container_run_kwargs["environment"] = environment
-        return container_run_kwargs
 
     def detect_issues(
         self,
@@ -115,7 +87,7 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
             result_type=QualityDetectionResult,
             failure_kwargs={"report": None},
             log_prefix="quality detection",
-            source={"mount_host_path": str(self._mount_host_path(dataset_path))},
+            source={},
             max_steps=int(self.agent_config.get("detect_max_steps", self.agent_config.get("max_steps", 10))),
             max_attempts=int(self.agent_config.get("detect_max_attempts", self.agent_config.get("max_attempts", 2))),
         )
@@ -148,7 +120,7 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
             result_type=QualityAnalysisResult,
             failure_kwargs={"analysis": None},
             log_prefix="quality analysis",
-            source={"mount_host_path": str(self._mount_host_path(dataset_path))},
+            source={},
             max_steps=int(self.agent_config.get("analyze_max_steps", self.agent_config.get("max_steps", 8))),
             max_attempts=int(self.agent_config.get("analyze_max_attempts", self.agent_config.get("max_attempts", 2))),
         )
@@ -182,7 +154,7 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
             result_type=QualityFixResult,
             failure_kwargs={"summary": None, "strategy_used": dict(strategy), "justification": ""},
             log_prefix="quality fix",
-            source={"mount_host_path": str(self._mount_host_path(dataset_path, output_path))},
+            source={},
             max_steps=int(self.agent_config.get("fix_max_steps", self.agent_config.get("max_steps", 12))),
             max_attempts=int(self.agent_config.get("fix_max_attempts", self.agent_config.get("max_attempts", 2))),
         )
@@ -212,7 +184,7 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
             result_type=QualityComparisonResult,
             failure_kwargs={"comparison": None},
             log_prefix="quality comparison",
-            source={"mount_host_path": str(self._mount_host_path(before_path, after_path))},
+            source={},
             max_steps=int(self.agent_config.get("compare_max_steps", self.agent_config.get("max_steps", 10))),
             max_attempts=int(self.agent_config.get("compare_max_attempts", self.agent_config.get("max_attempts", 2))),
         )
@@ -282,21 +254,21 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
         imbalance_threshold: float,
         preview_frame: Any | None,
     ) -> str:
-        sandbox_dataset_path = self._sandbox_dataset_path(dataset_path)
+        local_dataset_path = str(dataset_path.resolve())
         project_json = json.dumps(dict(project_context or {}), ensure_ascii=False)
         preview_json, schema_json = self._preview_and_schema_json(preview_frame)
         primary_modality = self._primary_modality(project_context, preview_frame)
         return (
             "Detect data quality issues in the real dataset by writing Python code and inspecting the actual rows.\n"
             f"Host dataset path: {dataset_path.as_posix()}\n"
-            f"Sandbox dataset path: {sandbox_dataset_path}\n"
+            f"Local dataset path: {local_dataset_path}\n"
             f"Project context: {project_json}\n"
             f"Primary modality: {primary_modality}\n"
             f"Preferred label column: {label_column or '<infer>'}\n"
             f"Imbalance threshold: {imbalance_threshold}\n"
             f"Schema: {schema_json}\n"
             f"Preview rows: {preview_json}\n"
-            "Load the dataset with pandas using the sandbox path.\n"
+            "Load the dataset with pandas using the local path.\n"
             "Return strict JSON with top-level fields `report` and optional `notes`.\n"
             "Write one end-to-end code block that computes the report and calls `final_answer(...)` directly.\n"
             "Do not spend steps on exploratory prints unless code execution fails.\n"
@@ -328,7 +300,7 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
         label_column: str | None,
         preview_frame: Any | None,
     ) -> str:
-        sandbox_dataset_path = self._sandbox_dataset_path(dataset_path)
+        local_dataset_path = str(dataset_path.resolve())
         report_json = json.dumps(dict(detection_report), ensure_ascii=False)
         project_json = json.dumps(dict(project_context or {}), ensure_ascii=False)
         strategy_json = json.dumps(dict(strategy_hint or {}), ensure_ascii=False)
@@ -337,7 +309,7 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
         return (
             "Interpret the dataset and recommend a meaningful quality strategy for the actual ML task.\n"
             f"Host dataset path: {dataset_path.as_posix()}\n"
-            f"Sandbox dataset path: {sandbox_dataset_path}\n"
+            f"Local dataset path: {local_dataset_path}\n"
             f"Project context: {project_json}\n"
             f"Primary modality: {primary_modality}\n"
             f"Task description: {task_description or '<none provided>'}\n"
@@ -383,24 +355,24 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
         label_column: str | None,
         imbalance_threshold: float,
     ) -> str:
-        sandbox_dataset_path = self._sandbox_dataset_path(dataset_path)
-        sandbox_output_path = self._sandbox_dataset_path(output_path)
+        local_dataset_path = str(dataset_path.resolve())
+        local_output_path = str(output_path.resolve())
         strategy_json = json.dumps(dict(strategy), ensure_ascii=False)
         analysis_json = json.dumps(dict(analysis_context or {}), ensure_ascii=False)
         primary_modality = self._primary_modality(None, None, analysis_context)
         return (
             "Clean the real dataset by writing Python code, applying the requested strategy, and saving the cleaned result.\n"
             f"Host input dataset path: {dataset_path.as_posix()}\n"
-            f"Sandbox input dataset path: {sandbox_dataset_path}\n"
+            f"Local input dataset path: {local_dataset_path}\n"
             f"Host output dataset path: {output_path.as_posix()}\n"
-            f"Sandbox output dataset path: {sandbox_output_path}\n"
+            f"Local output dataset path: {local_output_path}\n"
             f"Primary modality: {primary_modality}\n"
             f"Requested strategy: {strategy_json}\n"
             f"Task description: {task_description or 'general ML-ready tabular/text cleaning'}\n"
             f"Task-aware analysis context: {analysis_json}\n"
             f"Preferred label column: {label_column or '<infer>'}\n"
             f"Imbalance threshold: {imbalance_threshold}\n"
-            "Load the input dataset with pandas, apply the strategy directly in code, and write JSONL to the sandbox output path.\n"
+            "Load the input dataset with pandas, apply the strategy directly in code, and write JSONL to the local output path.\n"
             "Write one end-to-end code block that cleans, writes, and calls `final_answer(...)` directly.\n"
             "Do not spend steps on exploratory prints unless code execution fails.\n"
             "If object columns contain dicts or lists, normalize them to stable JSON strings before duplicate checks.\n"
@@ -432,21 +404,21 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
         label_column: str | None,
         imbalance_threshold: float,
     ) -> str:
-        sandbox_before_path = self._sandbox_dataset_path(before_path)
-        sandbox_after_path = self._sandbox_dataset_path(after_path)
+        local_before_path = str(before_path.resolve())
+        local_after_path = str(after_path.resolve())
         analysis_json = json.dumps(dict(analysis_context or {}), ensure_ascii=False)
         primary_modality = self._primary_modality(None, None, analysis_context)
         return (
             "Compare the real before and after datasets by writing Python code and computing quality metrics for both.\n"
             f"Host before dataset path: {before_path.as_posix()}\n"
-            f"Sandbox before dataset path: {sandbox_before_path}\n"
+            f"Local before dataset path: {local_before_path}\n"
             f"Host after dataset path: {after_path.as_posix()}\n"
-            f"Sandbox after dataset path: {sandbox_after_path}\n"
+            f"Local after dataset path: {local_after_path}\n"
             f"Primary modality: {primary_modality}\n"
             f"Task-aware analysis context: {analysis_json}\n"
             f"Preferred label column: {label_column or '<infer>'}\n"
             f"Imbalance threshold: {imbalance_threshold}\n"
-            "Load both datasets with pandas from the sandbox paths.\n"
+            "Load both datasets with pandas from the local paths.\n"
             "Write one end-to-end code block that computes the comparison and calls `final_answer(...)` directly.\n"
             "If object columns contain dicts or lists, normalize them to stable JSON strings before duplicate checks.\n"
             "Use the task-aware analysis context to emphasize meaningful metrics and mark irrelevant checks as not applicable.\n"
@@ -553,19 +525,6 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
         return lines
 
     @staticmethod
-    def _mount_host_path(*paths: Path) -> Path:
-        resolved_paths = [path.resolve() for path in paths]
-        project_root = PROJECT_ROOT.resolve()
-        if all(path.is_relative_to(project_root) for path in resolved_paths):
-            return PROJECT_ROOT
-        common = os.path.commonpath([str(path.parent if path.suffix else path) for path in resolved_paths])
-        return Path(common)
-
-    @staticmethod
-    def _sandbox_dataset_path(dataset_path: Path) -> str:
-        return _sandbox_mount(dataset_path)[2]
-
-    @staticmethod
     def _preview_and_schema_json(preview_frame: Any | None) -> tuple[str, str]:
         if preview_frame is None:
             return "[]", "{}"
@@ -616,14 +575,3 @@ class SmolagentsQualityBackend(_SmolagentsDockerBackendBase):
             if "audio" in columns:
                 return "audio"
         return "unknown"
-
-
-def _sandbox_mount(dataset_path: Path) -> tuple[Path, str, str]:
-    resolved_dataset_path = dataset_path.resolve()
-    resolved_project_root = PROJECT_ROOT.resolve()
-    if resolved_dataset_path.is_relative_to(resolved_project_root):
-        relative_path = resolved_dataset_path.relative_to(resolved_project_root)
-        return PROJECT_ROOT, "/workspace", (Path("/workspace") / relative_path).as_posix()
-    mount_host_path = resolved_dataset_path.parent
-    mount_container_path = "/workspace/input"
-    return mount_host_path, mount_container_path, (Path(mount_container_path) / resolved_dataset_path.name).as_posix()

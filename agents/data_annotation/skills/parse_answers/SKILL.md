@@ -1,6 +1,6 @@
 ---
 name: parse-answers
-description: Inspect raw annotation outputs from a real dataframe inside the sandbox and extract the final answer for each row as strict JSON.
+description: Inspect raw annotation outputs from a real dataframe locally and extract the final answer for each row as strict JSON.
 ---
 
 # Parse Answers
@@ -13,7 +13,7 @@ Load the real dataset, inspect the raw annotation outputs in the requested colum
 
 ## Runtime
 
-- Your Python runs inside the lightweight Docker sandbox.
+- Your Python runs inside the lightweight local execution runtime.
 - Imports are limited to the approved EDA-oriented modules provided by the host.
 - Do not use tools.
 - Do not use shell commands, `subprocess`, or arbitrary filesystem writes.
@@ -34,7 +34,7 @@ Call `final_answer(...)` exactly once.
 
 ## Parsing Rules
 
-- Load the dataframe from the provided sandbox path before making conclusions.
+- Load the dataframe from the provided local path before making conclusions.
 - Inspect real values in the requested raw output column.
 - Infer the answer format from the task prompt and the observed outputs.
 - Prefer the semantically final answer, not the whole reasoning chain.
