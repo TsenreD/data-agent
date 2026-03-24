@@ -83,14 +83,18 @@ class DataCollectionAgent(BaseAgent):
                 if source_result.attempts:
                     source_attempts[source_key] = source_result.attempts
                 if not source_result.success:
+                    failure_reason = self._summarize_source_failure(source_result)
                     failed_sources.append(
                         {
                             "source": source_key,
                             "type": source_type,
-                            "reason": source_result.logs[-1] if source_result.logs else "Collection failed.",
+                            "reason": failure_reason,
                         }
                     )
-                    self._record_log(f"Source {source_key} failed; continuing with remaining sources.", logs)
+                    self._record_log(
+                        f"Source {source_key} failed ({failure_reason}); continuing with remaining sources.",
+                        logs,
+                    )
                     continue
 
                 normalized = self._normalize_frame(source_result.dataframe, source)
@@ -254,6 +258,25 @@ class DataCollectionAgent(BaseAgent):
             logs=result.logs,
             attempts=result.attempts,
         )
+
+    @staticmethod
+    def _summarize_source_failure(result: SourceCollectionResult) -> str:
+        if result.attempts:
+            last = dict(result.attempts[-1])
+            error_message = str(last.get("error_message") or "").strip()
+            if error_message:
+                return error_message
+            notes = last.get("notes") or []
+            if notes:
+                note = str(notes[-1]).strip()
+                if note:
+                    return note
+            state = str(last.get("state") or "").strip()
+            if state:
+                return f"attempt state: {state}"
+        if result.logs:
+            return str(result.logs[-1])
+        return "Collection failed."
 
     def _record_existing_logs(self, entries: Sequence[str], logs: list[str]) -> None:
         for entry in entries:
