@@ -14,27 +14,24 @@
 
 ## Why This Matters
 
-This is a math reasoning dataset where the task is to solve math word problems. The 'label' column contains detailed chain-of-thought solutions, not simple class labels. The 20 rows with null labels are NOT missing data to impute - they are intentionally unlabeled math problems from project-euler and all-russian sources. Generic imputation strategies like 'median' for missing values are inappropriate here because: (1) these are not numeric values to average, (2) the unlabeled rows are valid problems that could be used for inference or labeled later. The recommended strategy preserves all 30 rows, drops the useless audio column, and keeps the dataset as a mixed supervised/unsupervised math problem collection. This maximizes utility for potential downstream tasks like math problem solving, curriculum learning, or active learning label generation.
+This is a math reasoning dataset where text (the problem statement) is the primary modality. Audio/image columns are entirely null and should be dropped. The 50% label null rate is not a data quality problem - it's a dataset design choice where different sources contribute different proportions of labeled vs unlabeled problems. The recommended strategy preserves all 100 rows because: (1) unlabeled math problems are still useful for evaluation, (2) they could be labeled later via model generation, (3) they provide source diversity. Class imbalance checks are irrelevant because the label is a numeric answer target (chain-of-thought with final answer), not a classification category. Numeric outlier detection on text length is misleading here - longer texts are simply more complex math problems, not errors.
 
 ## Priority Actions
 
-- drop_audio_column
-- preserve_unlabeled_rows_for_potential_label_generation
-- keep_image_urls_as_optional_reference
+- drop_null_modality_columns
+- preserve_unlabeled_math_problems
 
 ## Relevant Checks
 
-- text_completeness_all_30_rows_have_valid_text
-- label_format_verification_labels_use_chain_of_thought_format
-- source_balance_three_sources_10_each
-- text_length_distribution_math_problem_typical_lengths
+- text_non_empty
+- label_format_consistency
+- source_distribution
 
 ## Lower-Value Checks
 
-- class_balance_plots_not_useful_for_numeric_math_answers
-- outlier_detection_not_applicable_text_domain
-- imputation_for_missing_labels_not_recommended
-- audio_column_analysis_all_null
+- class_balance
+- numeric_outliers
+- imbalance_ratio
 
 ## Alternative Strategies
 

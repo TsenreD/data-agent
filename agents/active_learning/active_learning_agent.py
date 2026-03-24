@@ -1,10 +1,15 @@
+import argparse
 import json
 import math
+import os
+import pickle
 import random
 import re
+import runpy
+import subprocess
+import sys
 from copy import deepcopy
 from dataclasses import dataclass
-from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +23,20 @@ from ..base import AgentResult, BaseAgent
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+
+try:
+    import torch
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    TORCH_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised by environments without torch
+    torch = None
+    nn = None
+    DataLoader = None
+    TensorDataset = None
+    TORCH_AVAILABLE = False
 
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -45,6 +64,16 @@ TARGET_COLUMN_HINTS = {
 DEFAULT_QUERY_STRATEGY = "entropy"
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_REPORT_PATH = "active_learning_curve.png"
+DEFAULT_SCRIPT_PATH = "train_active_learning.py"
+DEFAULT_MODEL_PATH = "model.pth"
+DEFAULT_TRAINING_METRICS_PATH = "training_metrics.json"
+DEFAULT_TRAINING_IMAGE = "data-agent-active-learning-train"
+DEFAULT_DOCKER_MEMORY_LIMIT = "16g"
+DEFAULT_DOCKER_CPU_LIMIT = 8.0
+DEFAULT_DOCKER_PIDS_LIMIT = 2048
+DEFAULT_DOCKER_SHM_SIZE = "8g"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TRAIN_DOCKERFILE_PATH = Path(__file__).with_name("Dockerfile.train")
 
 
 @dataclass(slots=True)
@@ -53,6 +82,12 @@ class ActiveLearningArtifacts:
     queries_path: Path
     summary_path: Path
     report_path: Path
+    train_dataset_path: Path
+    val_dataset_path: Path
+    pool_dataset_path: Path
+    train_script_path: Path
+    model_path: Path
+    training_metrics_path: Path
 
 
 @dataclass(slots=True)
@@ -62,104 +97,366 @@ class TaskSelection:
     task_prompt: str
 
 
-class FastTextClassificationHead:
-    def __init__(
-        self,
+@dataclass(slots=True)
+class VocabularyEncoder:
+    token_to_index: dict[str, int]
+    unknown_index: int = 0
+
+    @classmethod
+    def fit(
+        cls,
+        texts: Sequence[str],
         *,
-        dim: int = 64,
-        bucket_size: int = 8192,
-        min_n: int = 3,
-        max_n: int = 6,
-        learning_rate: float = 0.05,
-        epochs: int = 25,
-        seed: int = 13,
-    ) -> None:
-        self.dim = int(dim)
-        self.bucket_size = int(bucket_size)
-        self.min_n = int(min_n)
-        self.max_n = int(max_n)
-        self.learning_rate = float(learning_rate)
-        self.epochs = int(epochs)
-        self.seed = int(seed)
-        self.rng = np.random.default_rng(self.seed)
-        self.embeddings: np.ndarray | None = None
-        self.head: np.ndarray | None = None
-        self.bias: np.ndarray | None = None
-        self.label_to_index: dict[str, int] = {}
-        self.index_to_label: list[str] = []
+        max_vocab: int,
+        min_token_freq: int,
+    ) -> "VocabularyEncoder":
+        counts: dict[str, int] = {}
+        for text in texts:
+            for token in TOKEN_PATTERN.findall((text or "").lower()):
+                counts[token] = counts.get(token, 0) + 1
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        kept = [token for token, freq in ranked if freq >= max(1, int(min_token_freq))][: max(0, int(max_vocab) - 1)]
+        token_to_index = {token: index + 1 for index, token in enumerate(kept)}
+        return cls(token_to_index=token_to_index, unknown_index=0)
 
-    def fit(self, texts: Sequence[str], labels: Sequence[str]) -> "FastTextClassificationHead":
-        unique_labels = sorted({str(label) for label in labels})
-        if len(unique_labels) < 2:
-            raise ValueError("Active learning requires at least two label classes.")
-        self.label_to_index = {label: idx for idx, label in enumerate(unique_labels)}
-        self.index_to_label = unique_labels
-        self.embeddings = self.rng.normal(0.0, 0.1, size=(self.bucket_size, self.dim))
-        self.head = self.rng.normal(0.0, 0.1, size=(self.dim, len(unique_labels)))
-        self.bias = np.zeros(len(unique_labels), dtype=float)
-        encoded = [self._feature_ids(text) for text in texts]
-        y = np.array([self.label_to_index[str(label)] for label in labels], dtype=int)
+    def transform(self, texts: Sequence[str]) -> np.ndarray:
+        matrix = np.zeros((len(texts), len(self.token_to_index) + 1), dtype=np.float32)
+        for row_index, text in enumerate(texts):
+            for token in TOKEN_PATTERN.findall((text or "").lower()):
+                token_index = self.token_to_index.get(token, self.unknown_index)
+                matrix[row_index, token_index] += 1.0
+        return matrix
 
-        indices = np.arange(len(encoded))
-        for _ in range(self.epochs):
-            self.rng.shuffle(indices)
-            for row_index in indices:
-                feature_ids = encoded[row_index]
-                if not feature_ids:
-                    continue
-                pooled = self.embeddings[feature_ids].mean(axis=0)
-                logits = pooled @ self.head + self.bias
-                probabilities = self._softmax(logits)
-                probabilities[y[row_index]] -= 1.0
-                head_snapshot = self.head.copy()
-                self.head -= self.learning_rate * np.outer(pooled, probabilities)
-                self.bias -= self.learning_rate * probabilities
-                grad_embedding = head_snapshot @ probabilities
-                unique_ids, counts = np.unique(feature_ids, return_counts=True)
-                scale = counts.astype(float) / float(len(feature_ids))
-                self.embeddings[unique_ids] -= self.learning_rate * np.outer(scale, grad_embedding)
-        return self
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "token_to_index": dict(self.token_to_index),
+            "unknown_index": int(self.unknown_index),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "VocabularyEncoder":
+        raw = payload.get("token_to_index", {})
+        token_to_index = {str(token): int(index) for token, index in dict(raw).items()}
+        unknown_index = int(payload.get("unknown_index", 0))
+        return cls(token_to_index=token_to_index, unknown_index=unknown_index)
+
+
+class CheckpointClassifier:
+    def __init__(self, checkpoint: Mapping[str, Any]) -> None:
+        self.checkpoint = dict(checkpoint)
+        self.architecture = str(self.checkpoint.get("architecture", "numpy_softmax"))
+        self.vectorizer = VocabularyEncoder.from_payload(self.checkpoint["vectorizer"])
+        self.index_to_label = [str(item) for item in self.checkpoint["index_to_label"]]
+
+        if self.architecture == "torch_mlp":
+            self.w1 = np.asarray(self.checkpoint["w1"], dtype=np.float32)
+            self.b1 = np.asarray(self.checkpoint["b1"], dtype=np.float32)
+            self.w2 = np.asarray(self.checkpoint["w2"], dtype=np.float32)
+            self.b2 = np.asarray(self.checkpoint["b2"], dtype=np.float32)
+            self.weights = None
+            self.bias = None
+        else:
+            self.weights = np.asarray(self.checkpoint["weights"], dtype=np.float32)
+            self.bias = np.asarray(self.checkpoint["bias"], dtype=np.float32)
+            self.w1 = None
+            self.b1 = None
+            self.w2 = None
+            self.b2 = None
 
     def predict_proba(self, texts: Sequence[str]) -> np.ndarray:
-        if self.embeddings is None or self.head is None or self.bias is None:
-            raise ValueError("Model must be fit before prediction.")
-        rows: list[np.ndarray] = []
-        uniform = np.full(len(self.index_to_label), 1.0 / len(self.index_to_label), dtype=float)
-        for text in texts:
-            feature_ids = self._feature_ids(text)
-            if not feature_ids:
-                rows.append(uniform.copy())
-                continue
-            pooled = self.embeddings[feature_ids].mean(axis=0)
-            rows.append(self._softmax(pooled @ self.head + self.bias))
-        return np.vstack(rows)
+        features = self.vectorizer.transform(texts)
+        return self._predict_proba_features(features)
 
     def predict(self, texts: Sequence[str]) -> list[str]:
         probabilities = self.predict_proba(texts)
         return [self.index_to_label[int(np.argmax(row))] for row in probabilities]
 
-    def _feature_ids(self, text: str) -> list[int]:
-        tokens = TOKEN_PATTERN.findall((text or "").lower())
-        feature_ids: list[int] = []
-        for token in tokens:
-            feature_ids.append(self._hash(token))
-            wrapped = f"<{token}>"
-            for size in range(self.min_n, self.max_n + 1):
-                if len(wrapped) < size:
-                    continue
-                for start in range(0, len(wrapped) - size + 1):
-                    feature_ids.append(self._hash(wrapped[start : start + size]))
-        return feature_ids
+    def _predict_proba_features(self, features: np.ndarray) -> np.ndarray:
+        if len(features) == 0:
+            return np.zeros((0, len(self.index_to_label)), dtype=np.float32)
+        if self.architecture == "torch_mlp":
+            hidden = np.maximum(0.0, features @ self.w1.T + self.b1)
+            logits = hidden @ self.w2.T + self.b2
+        else:
+            logits = features @ self.weights + self.bias
+        return _softmax_rows(logits)
 
-    def _hash(self, token: str) -> int:
-        digest = blake2b(token.encode("utf-8"), digest_size=8).digest()
-        return int.from_bytes(digest, "little") % self.bucket_size
+    @classmethod
+    def load(cls, path: Path) -> "CheckpointClassifier":
+        with path.open("rb") as handle:
+            payload = pickle.load(handle)
+        if not isinstance(payload, Mapping):
+            raise ValueError("Invalid model checkpoint payload.")
+        return cls(payload)
 
-    @staticmethod
-    def _softmax(logits: np.ndarray) -> np.ndarray:
-        shifted = logits - float(np.max(logits))
-        exp = np.exp(shifted)
-        return exp / exp.sum()
+
+def _softmax_rows(logits: np.ndarray) -> np.ndarray:
+    if len(logits) == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    exp = np.exp(shifted)
+    sums = np.clip(exp.sum(axis=1, keepdims=True), 1e-12, None)
+    return exp / sums
+
+
+def _encode_labels(labels: Sequence[str]) -> tuple[list[str], np.ndarray]:
+    classes = sorted({str(label) for label in labels})
+    if len(classes) < 2:
+        raise ValueError("Active learning requires at least two label classes.")
+    label_to_index = {label: index for index, label in enumerate(classes)}
+    encoded = np.asarray([label_to_index[str(label)] for label in labels], dtype=np.int64)
+    return classes, encoded
+
+
+def _accuracy(truth: Sequence[str], predicted: Sequence[str]) -> float:
+    if not truth:
+        return 0.0
+    matches = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected == actual)
+    return float(matches / len(truth))
+
+
+def _macro_f1(truth: Sequence[str], predicted: Sequence[str]) -> float:
+    labels = sorted(set(truth) | set(predicted))
+    if not labels:
+        return 0.0
+    scores: list[float] = []
+    for label in labels:
+        tp = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected == label and actual == label)
+        fp = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected != label and actual == label)
+        fn = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected == label and actual != label)
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        if precision + recall == 0.0:
+            scores.append(0.0)
+        else:
+            scores.append(2.0 * precision * recall / (precision + recall))
+    return float(sum(scores) / len(scores))
+
+
+def _train_torch_mlp(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    *,
+    hidden_dim: int,
+    epochs: int,
+    learning_rate: float,
+    batch_size: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("Torch backend requested but torch is not installed.")
+
+    if torch is None or nn is None or DataLoader is None or TensorDataset is None:  # pragma: no cover
+        raise RuntimeError("Torch modules are unavailable.")
+
+    class _TorchMLP(nn.Module):
+        def __init__(self, input_dim: int, inner_dim: int, output_dim: int) -> None:
+            super().__init__()
+            self.fc1 = nn.Linear(input_dim, inner_dim)
+            self.relu = nn.ReLU()
+            self.fc2 = nn.Linear(inner_dim, output_dim)
+
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            hidden = self.relu(self.fc1(features))
+            return self.fc2(hidden)
+
+    rng_seed = int(seed)
+    torch.manual_seed(rng_seed)
+    random.seed(rng_seed)
+
+    x_tensor = torch.from_numpy(x_train.astype(np.float32))
+    y_tensor = torch.from_numpy(y_train.astype(np.int64))
+    dataset = TensorDataset(x_tensor, y_tensor)
+    effective_batch = max(1, min(int(batch_size), len(dataset)))
+    loader = DataLoader(dataset, batch_size=effective_batch, shuffle=True)
+
+    model = _TorchMLP(x_train.shape[1], max(2, int(hidden_dim)), int(len(set(y_train.tolist()))))
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(learning_rate))
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for _ in range(max(1, int(epochs))):
+        for batch_x, batch_y in loader:
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(batch_x)
+            loss = criterion(logits, batch_y)
+            loss.backward()
+            optimizer.step()
+
+    state = model.state_dict()
+    w1 = state["fc1.weight"].detach().cpu().numpy().astype(np.float32)
+    b1 = state["fc1.bias"].detach().cpu().numpy().astype(np.float32)
+    w2 = state["fc2.weight"].detach().cpu().numpy().astype(np.float32)
+    b2 = state["fc2.bias"].detach().cpu().numpy().astype(np.float32)
+    return w1, b1, w2, b2
+
+
+def _train_numpy_softmax(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    *,
+    epochs: int,
+    learning_rate: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(int(seed))
+    n_features = int(x_train.shape[1])
+    n_classes = int(len(set(y_train.tolist())))
+    weights = rng.normal(0.0, 0.05, size=(n_features, n_classes)).astype(np.float32)
+    bias = np.zeros(n_classes, dtype=np.float32)
+
+    y_one_hot = np.eye(n_classes, dtype=np.float32)[y_train]
+    n_rows = float(max(1, len(x_train)))
+    for _ in range(max(1, int(epochs))):
+        logits = x_train @ weights + bias
+        probs = _softmax_rows(logits)
+        error = probs - y_one_hot
+        grad_w = (x_train.T @ error) / n_rows
+        grad_b = error.mean(axis=0)
+        weights -= float(learning_rate) * grad_w
+        bias -= float(learning_rate) * grad_b
+    return weights, bias
+
+
+def train_text_classifier(
+    train_texts: Sequence[str],
+    train_labels: Sequence[str],
+    *,
+    val_texts: Sequence[str],
+    val_labels: Sequence[str],
+    training_config: Mapping[str, Any],
+    random_seed: int,
+) -> tuple[CheckpointClassifier, dict[str, Any], dict[str, Any]]:
+    config = dict(training_config)
+    vectorizer = VocabularyEncoder.fit(
+        train_texts,
+        max_vocab=int(config.get("max_vocab", 5000)),
+        min_token_freq=int(config.get("min_token_freq", 1)),
+    )
+    x_train = vectorizer.transform(train_texts)
+    classes, y_train = _encode_labels(train_labels)
+    label_to_index = {label: index for index, label in enumerate(classes)}
+
+    if val_texts:
+        x_val = vectorizer.transform(val_texts)
+        y_val = np.asarray([label_to_index[str(label)] for label in val_labels], dtype=np.int64)
+        eval_features = x_val
+        eval_truth = [str(item) for item in val_labels]
+    else:
+        eval_features = x_train
+        eval_truth = [str(item) for item in train_labels]
+
+    epochs = int(config.get("epochs", 20))
+    learning_rate = float(config.get("learning_rate", 0.05))
+    hidden_dim = int(config.get("embedding_dim", 64))
+    batch_size = int(config.get("batch_size", 32))
+
+    checkpoint: dict[str, Any]
+    if TORCH_AVAILABLE:
+        w1, b1, w2, b2 = _train_torch_mlp(
+            x_train,
+            y_train,
+            hidden_dim=hidden_dim,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            seed=random_seed,
+        )
+        checkpoint = {
+            "architecture": "torch_mlp",
+            "vectorizer": vectorizer.to_payload(),
+            "index_to_label": classes,
+            "w1": w1,
+            "b1": b1,
+            "w2": w2,
+            "b2": b2,
+        }
+        backend = "torch"
+    else:
+        weights, bias = _train_numpy_softmax(
+            x_train,
+            y_train,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            seed=random_seed,
+        )
+        checkpoint = {
+            "architecture": "numpy_softmax",
+            "vectorizer": vectorizer.to_payload(),
+            "index_to_label": classes,
+            "weights": weights,
+            "bias": bias,
+        }
+        backend = "numpy_fallback"
+
+    model = CheckpointClassifier(checkpoint)
+    probabilities = model._predict_proba_features(eval_features)
+    predicted = [classes[int(np.argmax(row))] for row in probabilities]
+    metrics = {
+        "accuracy": _accuracy(eval_truth, predicted),
+        "macro_f1": _macro_f1(eval_truth, predicted),
+        "evaluated_rows": int(len(eval_truth)),
+        "train_rows": int(len(train_texts)),
+        "val_rows": int(len(val_texts)),
+        "backend": backend,
+    }
+    return model, metrics, checkpoint
+
+
+def run_training_job(config_path: str | Path) -> dict[str, Any]:
+    path = Path(config_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    train_path = Path(payload["train_path"])
+    val_path = Path(payload["val_path"])
+    feature_columns = [str(item) for item in payload["feature_columns"]]
+    target_column = str(payload["target_column"])
+
+    train_df = pd.read_json(train_path, lines=True)
+    val_df = pd.read_json(val_path, lines=True) if val_path.exists() else pd.DataFrame(columns=train_df.columns)
+
+    train_texts = _compose_texts_from_frame(train_df, feature_columns)
+    train_labels = [_normalize_label_value(item) for item in train_df[target_column].tolist()]
+    val_texts = _compose_texts_from_frame(val_df, feature_columns)
+    val_labels = [_normalize_label_value(item) for item in val_df[target_column].tolist()] if not val_df.empty else []
+
+    model, metrics, checkpoint = train_text_classifier(
+        train_texts,
+        train_labels,
+        val_texts=val_texts,
+        val_labels=val_labels,
+        training_config=payload.get("training", {}),
+        random_seed=int(payload.get("random_seed", 13)),
+    )
+
+    model_path = Path(payload["model_path"])
+    metrics_path = Path(payload["metrics_path"])
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with model_path.open("wb") as handle:
+        pickle.dump(checkpoint, handle)
+
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    return metrics
+
+
+def _compose_texts_from_frame(frame: pd.DataFrame, feature_columns: Sequence[str]) -> list[str]:
+    texts: list[str] = []
+    for _, row in frame.iterrows():
+        chunks: list[str] = []
+        for column in feature_columns:
+            value = row.get(column)
+            if pd.isna(value):
+                continue
+            chunks.append(str(value))
+        texts.append("\n".join(chunks))
+    return texts
+
+
+def _normalize_label_value(value: Any) -> str:
+    if isinstance(value, (bool, np.bool_)):
+        return "true" if bool(value) else "false"
+    return str(value).strip()
 
 
 class ActiveLearningAgent(BaseAgent):
@@ -181,8 +478,9 @@ class ActiveLearningAgent(BaseAgent):
         self.batch_size = int(self.active_config.get("batch_size", DEFAULT_BATCH_SIZE))
         self.test_size = float(self.active_config.get("test_size", 0.25))
         self.random_seed = int(self.active_config.get("random_seed", 13))
-        self.model_config = self._resolve_model_config()
-        self._model: FastTextClassificationHead | None = None
+        self.training_config = self._resolve_training_config()
+        self.docker_config = self._resolve_docker_config()
+        self._model: CheckpointClassifier | None = None
 
     def run(self, dataframe: pd.DataFrame, task_prompt: str | None = None) -> pd.DataFrame:
         result = self.execute({"dataframe": dataframe, "task_prompt": task_prompt or self.task_prompt})
@@ -197,6 +495,7 @@ class ActiveLearningAgent(BaseAgent):
         upstream = payload if isinstance(payload, AgentResult) else None
         frame = self._resolve_dataframe(payload)
         selection = self._select_task_columns(frame, payload)
+
         target_series = frame[selection.target_column]
         labeled_mask = target_series.notna()
         pool_mask = ~labeled_mask
@@ -205,8 +504,11 @@ class ActiveLearningAgent(BaseAgent):
         if labeled.empty:
             raise ValueError(f"ActiveLearningAgent requires labeled rows in `{selection.target_column}`.")
 
-        model, metrics = self.fit(labeled, selection=selection)
-        self._model = model
+        train_df, val_df = self._split_train_test(labeled, selection.target_column)
+        prepared = self._prepare_training_files(train_df, val_df, pool, selection)
+        metrics = self._run_generated_training(prepared, logs)
+
+        self._model = CheckpointClassifier.load(prepared.model_path)
         enriched = frame.copy()
         enriched["active_learning_score"] = np.nan
         enriched["active_learning_rank"] = np.nan
@@ -240,12 +542,13 @@ class ActiveLearningAgent(BaseAgent):
             "labeled_rows": int(len(labeled)),
             "pool_rows": int(len(pool)),
             "selected_rows": 0 if query_rows.empty else int(len(query_rows)),
-            "classes": sorted({str(value) for value in labeled[selection.target_column].dropna().tolist()}),
+            "classes": sorted({_normalize_label_value(value) for value in labeled[selection.target_column].dropna().tolist()}),
             "history": learning_curves["strategy_history"],
             "random_history": learning_curves["random_history"],
             "metrics": metrics,
+            "training_backend": metrics.get("backend"),
         }
-        artifacts = self._write_artifacts(enriched, query_rows, summary, report_path)
+        artifacts = self._write_artifacts(enriched, query_rows, summary, report_path, prepared)
 
         self._record_log(f"Wrote active learning dataset to {artifacts.dataset_path}.", logs)
         self._record_log(f"Wrote active learning queries to {artifacts.queries_path}.", logs)
@@ -264,6 +567,12 @@ class ActiveLearningAgent(BaseAgent):
             "active_learning_queries": str(artifacts.queries_path),
             "active_learning_summary": str(artifacts.summary_path),
             "active_learning_report": str(artifacts.report_path),
+            "active_learning_train_script": str(artifacts.train_script_path),
+            "active_learning_train_dataset": str(artifacts.train_dataset_path),
+            "active_learning_val_dataset": str(artifacts.val_dataset_path),
+            "active_learning_pool_dataset": str(artifacts.pool_dataset_path),
+            "active_learning_model": str(artifacts.model_path),
+            "active_learning_training_metrics": str(artifacts.training_metrics_path),
         }
         merged_metadata = {**upstream_metadata, "active_learning": summary}
         merged_metrics = {
@@ -273,6 +582,7 @@ class ActiveLearningAgent(BaseAgent):
             "active_learning_selected_rows": summary["selected_rows"],
         }
         merged_logs = self._merge_logs(upstream_logs, logs)
+
         return AgentResult(
             dataframe=enriched,
             dataframe_path=artifacts.dataset_path,
@@ -288,11 +598,20 @@ class ActiveLearningAgent(BaseAgent):
         labeled_df: pd.DataFrame,
         *,
         selection: TaskSelection,
-    ) -> tuple[FastTextClassificationHead, dict[str, float | int]]:
-        train_df, test_df = self._split_train_test(labeled_df, selection.target_column)
-        model = FastTextClassificationHead(**self.model_config)
-        model.fit(self._compose_texts(train_df, selection.feature_columns), self._target_labels(train_df, selection.target_column))
-        metrics = self.evaluate(train_df, test_df, selection=selection, model=model)
+    ) -> tuple[CheckpointClassifier, dict[str, float | int | str]]:
+        train_df, val_df = self._split_train_test(labeled_df, selection.target_column)
+        train_texts = self._compose_texts(train_df, selection.feature_columns)
+        train_labels = self._target_labels(train_df, selection.target_column)
+        val_texts = self._compose_texts(val_df, selection.feature_columns)
+        val_labels = self._target_labels(val_df, selection.target_column) if not val_df.empty else []
+        model, metrics, _ = train_text_classifier(
+            train_texts,
+            train_labels,
+            val_texts=val_texts,
+            val_labels=val_labels,
+            training_config=self.training_config,
+            random_seed=self.random_seed,
+        )
         return model, metrics
 
     def query(
@@ -320,7 +639,7 @@ class ActiveLearningAgent(BaseAgent):
         test_df: pd.DataFrame | None = None,
         *,
         selection: TaskSelection,
-        model: FastTextClassificationHead | None = None,
+        model: CheckpointClassifier | None = None,
     ) -> dict[str, float | int]:
         estimator = model or self._model
         if estimator is None:
@@ -373,10 +692,12 @@ class ActiveLearningAgent(BaseAgent):
                 queried = self.query(working_pool, strategy=strategy, selection=seed_selection)
                 if queried.empty:
                     break
-                acquired = queried.drop(columns=["active_learning_score", "active_learning_rank", "active_learning_selected"], errors="ignore")
+                acquired = queried.drop(
+                    columns=["active_learning_score", "active_learning_rank", "active_learning_selected", "__row_index"],
+                    errors="ignore",
+                )
                 working_labeled = pd.concat([working_labeled, acquired], ignore_index=False)
                 working_pool = working_pool.drop(index=queried["__row_index"].tolist(), errors="ignore")
-                working_pool = working_pool.drop(columns=["__row_index"], errors="ignore")
         finally:
             self.batch_size = original_batch_size
         return history
@@ -499,12 +820,10 @@ class ActiveLearningAgent(BaseAgent):
             non_null = series.dropna()
             if non_null.empty:
                 continue
-            if self._is_text_like(series):
-                continue
             unique_values = {str(value).lower() for value in non_null.tolist()}
             if len(unique_values) < 2:
                 continue
-            if len(unique_values) > max(20, int(len(non_null) * 0.6)):
+            if len(unique_values) > max(40, int(len(non_null) * 0.9)):
                 continue
             name_tokens = set(TOKEN_PATTERN.findall(column.lower()))
             value_tokens = set()
@@ -526,6 +845,364 @@ class ActiveLearningAgent(BaseAgent):
         if best_column is None:
             raise ValueError("ActiveLearningAgent could not identify a target column from the task prompt.")
         return best_column
+
+    def _prepare_training_files(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        pool_df: pd.DataFrame,
+        selection: TaskSelection,
+    ) -> ActiveLearningArtifacts:
+        train_dataset_path = self.output_dir / "train.jsonl"
+        val_dataset_path = self.output_dir / "val.jsonl"
+        pool_dataset_path = self.output_dir / "pool.jsonl"
+        train_script_path = self.output_dir / str(self.active_config.get("train_script_path", DEFAULT_SCRIPT_PATH))
+        model_path = self.output_dir / str(self.active_config.get("model_path", DEFAULT_MODEL_PATH))
+        training_metrics_path = self.output_dir / str(
+            self.active_config.get("training_metrics_path", DEFAULT_TRAINING_METRICS_PATH)
+        )
+
+        train_df.to_json(train_dataset_path, orient="records", lines=True, force_ascii=False, date_format="iso")
+        val_df.to_json(val_dataset_path, orient="records", lines=True, force_ascii=False, date_format="iso")
+        pool_df.to_json(pool_dataset_path, orient="records", lines=True, force_ascii=False, date_format="iso")
+
+        script_text = self._render_training_script()
+        train_script_path.write_text(script_text, encoding="utf-8")
+
+        training_payload = {
+            "train_path": str(train_dataset_path),
+            "val_path": str(val_dataset_path),
+            "feature_columns": selection.feature_columns,
+            "target_column": selection.target_column,
+            "training": self.training_config,
+            "random_seed": self.random_seed,
+            "model_path": str(model_path),
+            "metrics_path": str(training_metrics_path),
+        }
+        training_config_path = self.output_dir / "training_job_config.json"
+        training_config_path.write_text(json.dumps(training_payload, indent=2), encoding="utf-8")
+
+        return ActiveLearningArtifacts(
+            dataset_path=self.output_dir / "active_learning_dataset.jsonl",
+            queries_path=self.output_dir / "active_learning_queries.jsonl",
+            summary_path=self.output_dir / "active_learning_summary.json",
+            report_path=self.output_dir / str(self.active_config.get("report_path", DEFAULT_REPORT_PATH)),
+            train_dataset_path=train_dataset_path,
+            val_dataset_path=val_dataset_path,
+            pool_dataset_path=pool_dataset_path,
+            train_script_path=train_script_path,
+            model_path=model_path,
+            training_metrics_path=training_metrics_path,
+        )
+
+    def _render_training_script(self) -> str:
+        return (
+            "#!/usr/bin/env python3\n"
+            "\"\"\"Auto-generated by ActiveLearningAgent.\"\"\"\n"
+            "import argparse\n"
+            "from agents.active_learning.active_learning_agent import run_training_job\n"
+            "\n"
+            "\n"
+            "def main() -> int:\n"
+            "    parser = argparse.ArgumentParser(description='Run active-learning training job')\n"
+            "    parser.add_argument('--config', required=True, help='Path to training job config JSON')\n"
+            "    args = parser.parse_args()\n"
+            "    run_training_job(args.config)\n"
+            "    return 0\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+
+    def _run_generated_training(self, artifacts: ActiveLearningArtifacts, logs: list[str]) -> dict[str, Any]:
+        if self.docker_config["enabled"]:
+            self._run_training_in_docker(artifacts)
+        else:
+            self._run_training_locally(artifacts)
+
+        if not artifacts.training_metrics_path.exists():
+            raise RuntimeError("Generated training script did not produce training metrics.")
+        if not artifacts.model_path.exists():
+            raise RuntimeError("Generated training script did not produce model checkpoint.")
+
+        metrics = json.loads(artifacts.training_metrics_path.read_text(encoding="utf-8"))
+        location = "docker" if self.docker_config["enabled"] else "local interpreter"
+        self._record_log(f"Generated training script executed via {location}: {artifacts.train_script_path}", logs)
+        return metrics
+
+    def _run_training_locally(self, artifacts: ActiveLearningArtifacts) -> None:
+        training_config_path = self.output_dir / "training_job_config.json"
+        previous_argv = list(sys.argv)
+        try:
+            sys.argv = [str(artifacts.train_script_path), "--config", str(training_config_path)]
+            runpy.run_path(str(artifacts.train_script_path), run_name="__main__")
+        except SystemExit as exit_signal:
+            code = int(exit_signal.code) if isinstance(exit_signal.code, int) else 1
+            if code != 0:
+                raise RuntimeError(f"Generated training script failed with exit code {code}.") from exit_signal
+        finally:
+            sys.argv = previous_argv
+
+    def _run_training_in_docker(self, artifacts: ActiveLearningArtifacts) -> None:
+        if not TRAIN_DOCKERFILE_PATH.exists():
+            raise RuntimeError(f"Active-learning Dockerfile is missing: {TRAIN_DOCKERFILE_PATH}")
+
+        output_mount_host = self.output_dir.resolve()
+        output_mount_container = "/training_io"
+        project_mount_host = PROJECT_ROOT.resolve()
+        project_mount_container = "/workspace"
+
+        container_config_path = self._prepare_container_training_config(output_mount_container=output_mount_container)
+
+        image_name = str(self.docker_config["image_name"])
+        build_new_image = bool(self.docker_config["build_new_image"])
+        if not build_new_image and not self._docker_image_exists(image_name):
+            build_new_image = True
+        if build_new_image:
+            self._docker_build_image(image_name)
+
+        if bool(self.docker_config["agentic"]):
+            self._run_training_with_code_agent(
+                image_name=image_name,
+                output_mount_host=output_mount_host,
+                output_mount_container=output_mount_container,
+                project_mount_host=project_mount_host,
+                project_mount_container=project_mount_container,
+                script_name=artifacts.train_script_path.name,
+                config_name=container_config_path.name,
+            )
+            return
+
+        run_command = self._build_docker_run_command(
+            image_name=image_name,
+            output_mount_host=output_mount_host,
+            output_mount_container=output_mount_container,
+            project_mount_host=project_mount_host,
+            project_mount_container=project_mount_container,
+            script_name=artifacts.train_script_path.name,
+            config_name=container_config_path.name,
+        )
+        run_result = subprocess.run(run_command, capture_output=True, text=True)
+        if run_result.returncode != 0:
+            stderr = run_result.stderr.strip()
+            stdout = run_result.stdout.strip()
+            details = stderr or stdout or "unknown error"
+            raise RuntimeError(f"Docker training failed: {details}")
+
+    def _prepare_container_training_config(self, *, output_mount_container: str) -> Path:
+        host_config_path = self.output_dir / "training_job_config.json"
+        config_payload = json.loads(host_config_path.read_text(encoding="utf-8"))
+        config_payload["train_path"] = f"{output_mount_container}/{Path(config_payload['train_path']).name}"
+        config_payload["val_path"] = f"{output_mount_container}/{Path(config_payload['val_path']).name}"
+        config_payload["model_path"] = f"{output_mount_container}/{Path(config_payload['model_path']).name}"
+        config_payload["metrics_path"] = f"{output_mount_container}/{Path(config_payload['metrics_path']).name}"
+        container_config_path = self.output_dir / "training_job_config.container.json"
+        container_config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
+        return container_config_path
+
+    def _run_training_with_code_agent(
+        self,
+        *,
+        image_name: str,
+        output_mount_host: Path,
+        output_mount_container: str,
+        project_mount_host: Path,
+        project_mount_container: str,
+        script_name: str,
+        config_name: str,
+    ) -> None:
+        try:
+            import httpx
+            from smolagents import CodeAgent, OpenAIModel
+            from smolagents.agents import RunResult
+            from smolagents.monitoring import AgentLogger, LogLevel
+            from agents.data_collection.smolagents_backend import PrebakedDockerExecutor
+        except Exception as error:  # pragma: no cover - dependency failure fallback
+            raise RuntimeError(
+                "Agentic docker training requires smolagents with OpenAI-compatible model support."
+            ) from error
+
+        llm_config = self.config.get("llm", {})
+        if not isinstance(llm_config, Mapping):
+            llm_config = {}
+        base_url = str(
+            llm_config.get("api_base")
+            or llm_config.get("base_url")
+            or "http://localhost:11434/v1"
+        )
+        api_base = self._normalize_api_base(base_url)
+        api_key = str(llm_config.get("api_key") or os.getenv("OPENAI_API_KEY") or "ollama")
+        model_id = str(llm_config.get("model", "kimi-k2.5:cloud"))
+        model = OpenAIModel(
+            model_id=model_id,
+            api_base=api_base,
+            api_key=api_key,
+            client_kwargs={"http_client": httpx.Client(trust_env=False)},
+            temperature=float(llm_config.get("temperature", 0.1)),
+            max_tokens=int(llm_config.get("max_tokens", 4000)),
+        )
+
+        sandbox_config = llm_config.get("sandbox", {}) if isinstance(llm_config, Mapping) else {}
+        sandbox_mapping = dict(sandbox_config) if isinstance(sandbox_config, Mapping) else {}
+        host = str(self.docker_config.get("host", sandbox_mapping.get("host", "127.0.0.1")))
+        port = int(self.docker_config.get("port", sandbox_mapping.get("port", 8892)))
+
+        container_run_kwargs = {
+            "mem_limit": str(self.docker_config["memory_limit"]),
+            "cpu_quota": int(float(self.docker_config["cpu_limit"]) * 100000),
+            "pids_limit": int(self.docker_config["pids_limit"]),
+            "shm_size": str(self.docker_config["shm_size"]),
+            "volumes": {
+                str(project_mount_host): {"bind": project_mount_container, "mode": "ro"},
+                str(output_mount_host): {"bind": output_mount_container, "mode": "rw"},
+            },
+            "working_dir": project_mount_container,
+            "environment": {"PYTHONPATH": project_mount_container},
+        }
+        dockerfile_content = TRAIN_DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+        executor = PrebakedDockerExecutor(
+            host=host,
+            port=port,
+            image_name=image_name,
+            build_new_image=False,
+            container_run_kwargs=container_run_kwargs,
+            dockerfile_content=dockerfile_content,
+            additional_imports=[
+                "json",
+                "pathlib",
+                "pickle",
+                "numpy",
+                "pandas",
+                "torch",
+            ],
+            logger=AgentLogger(level=LogLevel.ERROR),
+        )
+
+        task = self._build_agentic_training_task(
+            output_mount_container=output_mount_container,
+            script_name=script_name,
+            config_name=config_name,
+        )
+        instructions = (
+            "You are a model-training coding agent. "
+            "Write robust Python code, run it, inspect runtime outputs, and refine until training succeeds. "
+            "You must produce the requested files and end with strict JSON in final_answer."
+        )
+        max_steps = int(self.docker_config["max_steps"])
+        with CodeAgent(
+            tools=[],
+            model=model,
+            executor=executor,
+            executor_type="docker",
+            additional_authorized_imports=[
+                "json",
+                "pathlib",
+                "pickle",
+                "numpy",
+                "pandas",
+                "torch",
+            ],
+            max_steps=max_steps,
+            verbosity_level=1,
+            instructions=instructions,
+        ) as agent:
+            run_result = agent.run(task, max_steps=max_steps, return_full_result=True)
+            if not isinstance(run_result, RunResult):
+                raise RuntimeError("Agentic docker training returned an unexpected result type.")
+
+    def _build_agentic_training_task(
+        self,
+        *,
+        output_mount_container: str,
+        script_name: str,
+        config_name: str,
+    ) -> str:
+        script_path = f"{output_mount_container}/{script_name}"
+        config_path = f"{output_mount_container}/{config_name}"
+        return (
+            "Train an active-learning classifier using the provided config and dataset files.\n"
+            f"Config JSON path: {config_path}\n"
+            f"Output script path to create/update: {script_path}\n"
+            "Requirements:\n"
+            "1) Read config JSON and train a torch-based classifier.\n"
+            "2) Write checkpoint to `model_path` and metrics JSON to `metrics_path` from config.\n"
+            "3) If first implementation fails, debug using errors and rerun.\n"
+            "4) Keep script deterministic with explicit random seeds.\n"
+            "5) Return final JSON with keys: success (bool), model_path, metrics_path, notes.\n"
+            "Use only Python code execution and finish with final_answer(json.dumps(...))."
+        )
+
+    def _docker_image_exists(self, image_name: str) -> bool:
+        result = subprocess.run(
+            ["docker", "inspect", "--type=image", image_name],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    def _docker_build_image(self, image_name: str) -> None:
+        build_command = [
+            "docker",
+            "build",
+            "-f",
+            str(TRAIN_DOCKERFILE_PATH),
+            "-t",
+            image_name,
+            str(PROJECT_ROOT),
+        ]
+        result = subprocess.run(build_command, capture_output=True, text=True)
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            details = stderr or stdout or "unknown error"
+            raise RuntimeError(f"Unable to build Docker image for active learning training: {details}")
+
+    def _build_docker_run_command(
+        self,
+        *,
+        image_name: str,
+        output_mount_host: Path,
+        output_mount_container: str,
+        project_mount_host: Path,
+        project_mount_container: str,
+        script_name: str,
+        config_name: str,
+    ) -> list[str]:
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--memory",
+            str(self.docker_config["memory_limit"]),
+            "--cpus",
+            str(self.docker_config["cpu_limit"]),
+            "--pids-limit",
+            str(self.docker_config["pids_limit"]),
+            "--shm-size",
+            str(self.docker_config["shm_size"]),
+            "-e",
+            f"PYTHONPATH={project_mount_container}",
+            "-v",
+            f"{project_mount_host}:{project_mount_container}:ro",
+            "-v",
+            f"{output_mount_host}:{output_mount_container}:rw",
+            "-w",
+            project_mount_container,
+            image_name,
+            "python",
+            f"{output_mount_container}/{script_name}",
+            "--config",
+            f"{output_mount_container}/{config_name}",
+        ]
+
+    @staticmethod
+    def _normalize_api_base(api_base: str) -> str:
+        normalized = api_base.rstrip("/")
+        if normalized.endswith("/chat/completions"):
+            return normalized[: -len("/chat/completions")]
+        return normalized
 
     def _resolve_dataframe(self, payload: Any | None) -> pd.DataFrame:
         if isinstance(payload, AgentResult):
@@ -562,17 +1239,48 @@ class ActiveLearningAgent(BaseAgent):
             return dict(agents_config["active_learning"])
         return {}
 
-    def _resolve_model_config(self) -> dict[str, Any]:
-        raw = self.active_config.get("model", {})
-        config = dict(raw) if isinstance(raw, Mapping) else {}
+    def _resolve_training_config(self) -> dict[str, Any]:
+        training = self.active_config.get("training", {})
+        training_config = dict(training) if isinstance(training, Mapping) else {}
+
+        legacy_model = self.active_config.get("model", {})
+        if isinstance(legacy_model, Mapping):
+            if "embedding_dim" not in training_config and "dim" in legacy_model:
+                training_config["embedding_dim"] = int(legacy_model["dim"])
+            if "epochs" not in training_config and "epochs" in legacy_model:
+                training_config["epochs"] = int(legacy_model["epochs"])
+            if "learning_rate" not in training_config and "learning_rate" in legacy_model:
+                training_config["learning_rate"] = float(legacy_model["learning_rate"])
+
         return {
-            "dim": int(config.get("dim", 64)),
-            "bucket_size": int(config.get("bucket_size", 8192)),
-            "min_n": int(config.get("min_n", 3)),
-            "max_n": int(config.get("max_n", 6)),
-            "learning_rate": float(config.get("learning_rate", 0.05)),
-            "epochs": int(config.get("epochs", 25)),
-            "seed": self.random_seed,
+            "embedding_dim": int(training_config.get("embedding_dim", 64)),
+            "epochs": int(training_config.get("epochs", 20)),
+            "batch_size": int(training_config.get("batch_size", 32)),
+            "learning_rate": float(training_config.get("learning_rate", 0.05)),
+            "max_vocab": int(training_config.get("max_vocab", 5000)),
+            "min_token_freq": int(training_config.get("min_token_freq", 1)),
+        }
+
+    def _resolve_docker_config(self) -> dict[str, Any]:
+        docker_config = self.active_config.get("docker", {})
+        resolved = dict(docker_config) if isinstance(docker_config, Mapping) else {}
+
+        llm = self.config.get("llm", {})
+        sandbox = llm.get("sandbox", {}) if isinstance(llm, Mapping) else {}
+        sandbox_map = dict(sandbox) if isinstance(sandbox, Mapping) else {}
+
+        return {
+            "enabled": bool(resolved.get("enabled", True)),
+            "agentic": bool(resolved.get("agentic", True)),
+            "max_steps": int(resolved.get("max_steps", 8)),
+            "image_name": str(resolved.get("image_name", DEFAULT_TRAINING_IMAGE)),
+            "build_new_image": bool(resolved.get("build_new_image", False)),
+            "memory_limit": str(resolved.get("memory_limit", sandbox_map.get("memory_limit", DEFAULT_DOCKER_MEMORY_LIMIT))),
+            "cpu_limit": float(resolved.get("cpu_limit", sandbox_map.get("cpu_limit", DEFAULT_DOCKER_CPU_LIMIT))),
+            "pids_limit": int(resolved.get("pids_limit", sandbox_map.get("pids_limit", DEFAULT_DOCKER_PIDS_LIMIT))),
+            "shm_size": str(resolved.get("shm_size", sandbox_map.get("shm_size", DEFAULT_DOCKER_SHM_SIZE))),
+            "host": str(resolved.get("host", sandbox_map.get("host", "127.0.0.1"))),
+            "port": int(resolved.get("port", sandbox_map.get("port", 8892))),
         }
 
     def _write_artifacts(
@@ -581,49 +1289,43 @@ class ActiveLearningAgent(BaseAgent):
         queries: pd.DataFrame,
         summary: Mapping[str, Any],
         report_path: Path,
+        prepared: ActiveLearningArtifacts,
     ) -> ActiveLearningArtifacts:
-        dataset_path = self.output_dir / "active_learning_dataset.jsonl"
-        queries_path = self.output_dir / "active_learning_queries.jsonl"
-        summary_path = self.output_dir / "active_learning_summary.json"
-        enriched.to_json(dataset_path, orient="records", lines=True, force_ascii=False, date_format="iso")
+        prepared.dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        enriched.to_json(prepared.dataset_path, orient="records", lines=True, force_ascii=False, date_format="iso")
         queries.drop(columns=["__row_index"], errors="ignore").to_json(
-            queries_path,
+            prepared.queries_path,
             orient="records",
             lines=True,
             force_ascii=False,
             date_format="iso",
         )
-        summary_path.write_text(json.dumps(dict(summary), indent=2), encoding="utf-8")
-        return ActiveLearningArtifacts(
-            dataset_path=dataset_path,
-            queries_path=queries_path,
-            summary_path=summary_path,
-            report_path=report_path,
-        )
+        prepared.summary_path.write_text(json.dumps(dict(summary), indent=2), encoding="utf-8")
+        prepared.report_path = report_path
+        return prepared
 
     def _split_train_test(self, frame: pd.DataFrame, target_column: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         if len(frame) < 6:
             return frame.copy(), frame.iloc[0:0].copy()
         shuffled = frame.sample(frac=1.0, random_state=self.random_seed)
         test_size = max(1, min(len(shuffled) - 2, int(round(len(shuffled) * self.test_size))))
-        return shuffled.iloc[:-test_size].copy(), shuffled.iloc[-test_size:].copy()
+        train_df = shuffled.iloc[:-test_size].copy()
+        val_df = shuffled.iloc[-test_size:].copy()
+
+        train_unique = train_df[target_column].dropna().apply(_normalize_label_value).nunique()
+        if train_unique < 2:
+            return frame.copy(), frame.iloc[0:0].copy()
+        return train_df, val_df
 
     def _compose_texts(self, frame: pd.DataFrame, feature_columns: Sequence[str]) -> list[str]:
-        texts: list[str] = []
-        for _, row in frame.iterrows():
-            chunks = []
-            for column in feature_columns:
-                value = row.get(column)
-                if pd.isna(value):
-                    continue
-                chunks.append(str(value))
-            texts.append("\n".join(chunks))
-        return texts
+        return _compose_texts_from_frame(frame, feature_columns)
 
     def _target_labels(self, frame: pd.DataFrame, target_column: str) -> list[str]:
-        return [self._normalize_label(value) for value in frame[target_column].tolist()]
+        return [_normalize_label_value(value) for value in frame[target_column].tolist()]
 
     def _uncertainty_scores(self, probabilities: np.ndarray, strategy: str) -> np.ndarray:
+        if len(probabilities) == 0:
+            return np.asarray([], dtype=np.float32)
         if strategy == "random":
             rng = np.random.default_rng(self.random_seed)
             return rng.random(len(probabilities))
@@ -634,11 +1336,6 @@ class ActiveLearningAgent(BaseAgent):
         entropy = -(probabilities * np.log(probabilities + epsilon)).sum(axis=1)
         return entropy
 
-    def _normalize_label(self, value: Any) -> str:
-        if isinstance(value, (bool, np.bool_)):
-            return "true" if bool(value) else "false"
-        return str(value).strip()
-
     def _record_log(self, message: str, logs: list[str]) -> None:
         logs.append(message)
 
@@ -646,27 +1343,10 @@ class ActiveLearningAgent(BaseAgent):
         return [*upstream_logs, *logs]
 
     def _accuracy(self, truth: Sequence[str], predicted: Sequence[str]) -> float:
-        if not truth:
-            return 0.0
-        matches = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected == actual)
-        return matches / len(truth)
+        return _accuracy(truth, predicted)
 
     def _macro_f1(self, truth: Sequence[str], predicted: Sequence[str]) -> float:
-        labels = sorted(set(truth) | set(predicted))
-        if not labels:
-            return 0.0
-        scores: list[float] = []
-        for label in labels:
-            tp = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected == label and actual == label)
-            fp = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected != label and actual == label)
-            fn = sum(1 for expected, actual in zip(truth, predicted, strict=False) if expected == label and actual != label)
-            precision = tp / (tp + fp) if (tp + fp) else 0.0
-            recall = tp / (tp + fn) if (tp + fn) else 0.0
-            if precision + recall == 0.0:
-                scores.append(0.0)
-            else:
-                scores.append(2.0 * precision * recall / (precision + recall))
-        return float(sum(scores) / len(scores))
+        return _macro_f1(truth, predicted)
 
     def _read_dataframe(self, path: Path) -> pd.DataFrame:
         if path.suffix.lower() == ".csv":
@@ -700,3 +1380,15 @@ class ActiveLearningAgent(BaseAgent):
         if output_dir.name == stage_name:
             return output_dir
         return output_dir / stage_name
+
+
+def _main_training_script() -> int:
+    parser = argparse.ArgumentParser(description="Run ActiveLearning training from config")
+    parser.add_argument("--config", required=True, help="Path to training config JSON")
+    args = parser.parse_args()
+    run_training_job(args.config)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main_training_script())

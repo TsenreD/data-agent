@@ -2,6 +2,7 @@ import json
 import math
 import sys
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from .smolagents_backend import SmolagentsAnnotationBackend, SmolagentsParserBac
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.75
 DEFAULT_MAX_TOKENS = 8192
+DEFAULT_TIMEOUT_PER_ROW_SECONDS = 600
 JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 
 
@@ -326,14 +328,11 @@ class DataAnnotationAgent(BaseAgent):
                         "confidence": float(row.get("annotation_confidence", 0.0) or 0.0),
                         "source": self._json_ready(row.get("source")),
                     },
-                    "annotations": [
+                    "predictions": [
                         {
-                            "id": f"annotation-{index - 1}",
-                            "completed_by": "data_annotation_agent",
-                            "was_cancelled": False,
-                            "ground_truth": False,
+                            "model_version": "data_annotation_agent",
+                            "score": float(row.get("annotation_confidence", 0.0) or 0.0),
                             "result": annotation_result,
-                            "lead_time": 0.0,
                         }
                     ],
                 }
@@ -494,26 +493,53 @@ class DataAnnotationAgent(BaseAgent):
             )
         raw_responses: list[Any] = [None] * len(rows)
         max_workers = max(1, int(self.process_config.get("parallel_workers", 1)))
+        remaining_indices = list(range(len(rows)))
+        max_rounds = max(1, int(self.process_config.get("pass_retry_rounds", 2)))
+        backoff_seconds = max(0.0, float(self.process_config.get("pass_retry_backoff_seconds", 2.0)))
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    self._annotate_single_row,
-                    row_index=index,
-                    row=row,
-                    prompt=prompt,
-                    fewshot_samples=fewshot_samples,
-                ): index
-                for index, row in enumerate(rows)
-            }
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    raw_responses[index] = future.result()
-                except Exception as error:
-                    message = f"{type(error).__name__}: {error}"
-                    self._record_log(f"Annotation {pass_name} row {index} error: {message}", logs)
-                    raw_responses[index] = None
+        for round_number in range(1, max_rounds + 1):
+            if not remaining_indices:
+                break
+            if round_number == 1:
+                round_workers = max_workers
+            else:
+                # Reduce pressure on the local model endpoint on retry rounds.
+                round_workers = max(1, max_workers // (2 ** (round_number - 1)))
+            self._record_log(
+                f"Annotation {pass_name} round {round_number}: "
+                f"{len(remaining_indices)} rows pending, workers={round_workers}.",
+                logs,
+            )
+            next_remaining: list[int] = []
+            with ThreadPoolExecutor(max_workers=round_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._annotate_single_row,
+                        row_index=index,
+                        row=rows[index],
+                        prompt=prompt,
+                        fewshot_samples=fewshot_samples,
+                    ): index
+                    for index in remaining_indices
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        raw_responses[index] = future.result()
+                    except Exception as error:
+                        message = f"{type(error).__name__}: {error}"
+                        self._record_log(f"Annotation {pass_name} row {index} error: {message}", logs)
+                        raw_responses[index] = None
+                        next_remaining.append(index)
+            remaining_indices = next_remaining
+            if remaining_indices and round_number < max_rounds and backoff_seconds > 0.0:
+                time.sleep(backoff_seconds)
+
+        if remaining_indices:
+            self._record_log(
+                f"Annotation {pass_name}: {len(remaining_indices)} rows still failed after {max_rounds} rounds.",
+                logs,
+            )
         self._record_log(f"Finished annotation {pass_name}.", logs)
         return AnnotationPassResult(raw_responses=raw_responses, logs=logs)
 
@@ -837,7 +863,7 @@ class DataAnnotationAgent(BaseAgent):
             model=str(self.process_config.get("model", "default")),
             base_url=str(self.process_config["base_url"]),
             api_key=self.process_config.get("api_key"),
-            timeout=int(self.process_config.get("timeout_per_row", 120)),
+            timeout=int(self.process_config.get("timeout_per_row", DEFAULT_TIMEOUT_PER_ROW_SECONDS)),
             max_tokens=int(self.process_config.get("max_tokens", DEFAULT_MAX_TOKENS)),
             headers=self.process_config.get("headers"),
             max_retries=int(self.process_config.get("max_retries", 1)),
@@ -1033,7 +1059,7 @@ class DataAnnotationAgent(BaseAgent):
             configured = {}
         merged = {
             "parallel_workers": 200,
-            "timeout_per_row": 120,
+            "timeout_per_row": DEFAULT_TIMEOUT_PER_ROW_SECONDS,
             "max_retries": 1,
             "max_tokens": DEFAULT_MAX_TOKENS,
             "model": configured.get("model") or llm_config.get("model") or "default",

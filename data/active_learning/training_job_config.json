@@ -1,0 +1,19 @@
+{
+  "train_path": "data/active_learning/train.jsonl",
+  "val_path": "data/active_learning/val.jsonl",
+  "feature_columns": [
+    "text"
+  ],
+  "target_column": "label",
+  "training": {
+    "embedding_dim": 64,
+    "epochs": 25,
+    "batch_size": 32,
+    "learning_rate": 0.05,
+    "max_vocab": 5000,
+    "min_token_freq": 1
+  },
+  "random_seed": 13,
+  "model_path": "data/active_learning/model.pth",
+  "metrics_path": "data/active_learning/training_metrics.json"
+}

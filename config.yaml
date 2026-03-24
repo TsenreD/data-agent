@@ -57,8 +57,8 @@ agents:
       Solve the text problem, put your answer in \boxed{}.
       If a problem is incomplete (and has no solution), set label to "invalid".
     process_config:
-      parallel_workers: 30
-      timeout_per_row: 120
+      parallel_workers: 50
+      timeout_per_row: 600
       max_retries: 2
       max_tokens: 8192
   active_learning:
@@ -78,6 +78,15 @@ agents:
       max_n: 6
       learning_rate: 0.05
       epochs: 25
+    docker:
+      enabled: true
+      agentic: true
+      max_steps: 8
+      image_name: data-agent-active-learning-train
+      memory_limit: "16g"
+      cpu_limit: 8
+      pids_limit: 2048
+      shm_size: "8g"
 
 
 sources:

@@ -50,34 +50,34 @@ def _agent_enabled(config: Mapping[str, Any], agent_name: str) -> bool:
 def build_runner(config_path: Path, output_dir: Path) -> PipelineRunner:
     config = _load_config(config_path)
     agents = []
-    if _agent_enabled(config, "collection"):
-        agents.append(
-            DataCollectionAgent(
-                config=config_path,
-                output_dir=output_dir,
-            )
-        )
-    if _agent_enabled(config, "quality"):
-        agents.append(
-            DataQualityAgent(
-                config=config_path,
-                output_dir=output_dir,
-            )
-        )
-    if _agent_enabled(config, "annotation"):
-        agents.append(
-            DataAnnotationAgent(
-                config=config_path,
-                output_dir=output_dir,
-            )
-        )
-    # if _agent_enabled(config, "active_learning"):
+    # if _agent_enabled(config, "collection"):
     #     agents.append(
-    #         ActiveLearningAgent(
+    #         DataCollectionAgent(
     #             config=config_path,
     #             output_dir=output_dir,
     #         )
     #     )
+    # if _agent_enabled(config, "quality"):
+    #     agents.append(
+    #         DataQualityAgent(
+    #             config=config_path,
+    #             output_dir=output_dir,
+    #         )
+    #     )
+    # if _agent_enabled(config, "annotation"):
+    #     agents.append(
+    #         DataAnnotationAgent(
+    #             config=config_path,
+    #             output_dir=output_dir,
+    #         )
+    #     )
+    if _agent_enabled(config, "active_learning"):
+        agents.append(
+            ActiveLearningAgent(
+                config=config_path,
+                output_dir=output_dir,
+            )
+        )
     return PipelineRunner(agents)
 
 
