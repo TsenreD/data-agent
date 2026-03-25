@@ -1,6 +1,5 @@
 import argparse
 import json
-import math
 import os
 import pickle
 import random
@@ -548,7 +547,7 @@ class ActiveLearningAgent(BaseAgent):
             for row_index in selected_indices:
                 enriched.at[row_index, "active_learning_selected"] = True
 
-        learning_curves = self._build_learning_curve(labeled, selection)
+        learning_curves = self._build_learning_curve_from_training_metrics(metrics)
         report_path = self.report(
             learning_curves["strategy_history"],
             random_history=learning_curves["random_history"],
@@ -755,36 +754,66 @@ class ActiveLearningAgent(BaseAgent):
         plt.close()
         return report_path
 
-    def _build_learning_curve(self, labeled_df: pd.DataFrame, selection: TaskSelection) -> dict[str, list[dict[str, float | int | str]]]:
-        if len(labeled_df) < 6:
-            return {"strategy_history": [], "random_history": []}
-        shuffled = labeled_df.sample(frac=1.0, random_state=self.random_seed)
-        baseline_size = max(4, min(len(shuffled) - 2, self.batch_size))
-        initial = shuffled.iloc[:baseline_size].copy()
-        pool = shuffled.iloc[baseline_size:].copy()
-        if pool.empty:
-            return {"strategy_history": [], "random_history": []}
-        iterations = max(1, min(4, math.ceil(len(pool) / max(1, self.batch_size))))
-        prompt = selection.task_prompt
-        history = self.run_cycle(
-            initial,
-            pool,
+    def _build_learning_curve_from_training_metrics(
+        self,
+        metrics: Mapping[str, Any],
+    ) -> dict[str, list[dict[str, float | int | str]]]:
+        strategy_history = self._normalize_curve_history(
+            metrics.get("history")
+            or metrics.get("learning_curve")
+            or metrics.get("curve")
+            or metrics.get("strategy_history"),
             strategy=self.query_strategy,
-            n_iterations=iterations,
-            batch_size=min(self.batch_size, max(1, len(pool))),
-            task_prompt=prompt,
         )
-        if not history:
-            return {"strategy_history": [], "random_history": []}
-        random_history = self.run_cycle(
-            initial,
-            pool,
+        random_history = self._normalize_curve_history(
+            metrics.get("random_history") or metrics.get("baseline_history") or metrics.get("random_curve"),
             strategy="random",
-            n_iterations=iterations,
-            batch_size=min(self.batch_size, max(1, len(pool))),
-            task_prompt=prompt,
         )
-        return {"strategy_history": history, "random_history": random_history}
+        if strategy_history:
+            return {"strategy_history": strategy_history, "random_history": random_history}
+
+        # Fallback: make a single-point curve from top-level training metrics.
+        macro_f1 = metrics.get("macro_f1")
+        accuracy = metrics.get("accuracy")
+        train_rows = metrics.get("train_rows")
+        if macro_f1 is None or train_rows is None:
+            return {"strategy_history": [], "random_history": random_history}
+        single_point = {
+            "iteration": 1,
+            "n_labeled": int(train_rows),
+            "accuracy": float(accuracy if accuracy is not None else 0.0),
+            "macro_f1": float(macro_f1),
+            "strategy": self.query_strategy,
+        }
+        return {"strategy_history": [single_point], "random_history": random_history}
+
+    @staticmethod
+    def _normalize_curve_history(
+        raw_history: Any,
+        *,
+        strategy: str,
+    ) -> list[dict[str, float | int | str]]:
+        if not isinstance(raw_history, Sequence) or isinstance(raw_history, (str, bytes)):
+            return []
+        normalized: list[dict[str, float | int | str]] = []
+        for index, row in enumerate(raw_history, start=1):
+            if not isinstance(row, Mapping):
+                continue
+            n_labeled = row.get("n_labeled", row.get("labeled_rows", row.get("train_rows")))
+            macro_f1 = row.get("macro_f1", row.get("f1", row.get("val_macro_f1", row.get("val_f1"))))
+            accuracy = row.get("accuracy", row.get("val_accuracy", 0.0))
+            if n_labeled is None or macro_f1 is None:
+                continue
+            normalized.append(
+                {
+                    "iteration": int(row.get("iteration", index)),
+                    "n_labeled": int(n_labeled),
+                    "accuracy": float(accuracy),
+                    "macro_f1": float(macro_f1),
+                    "strategy": str(row.get("strategy", strategy)),
+                }
+            )
+        return normalized
 
     def _select_task_columns(self, frame: pd.DataFrame, payload: Any | None) -> TaskSelection:
         prompt = self._resolve_task_prompt(payload)
@@ -891,14 +920,14 @@ class ActiveLearningAgent(BaseAgent):
         train_script_path.write_text(script_text, encoding="utf-8")
 
         training_payload = {
-            "train_path": str(train_dataset_path),
-            "val_path": str(val_dataset_path),
+            "train_path": str(train_dataset_path.resolve()),
+            "val_path": str(val_dataset_path.resolve()),
             "feature_columns": selection.feature_columns,
             "target_column": selection.target_column,
             "task_prompt": selection.task_prompt,
             "random_seed": self.random_seed,
-            "model_path": str(model_path),
-            "metrics_path": str(training_metrics_path),
+            "model_path": str(model_path.resolve()),
+            "metrics_path": str(training_metrics_path.resolve()),
         }
         training_config_path = self.output_dir / "training_job_config.json"
         training_config_path.write_text(json.dumps(training_payload, indent=2), encoding="utf-8")
@@ -943,6 +972,26 @@ class ActiveLearningAgent(BaseAgent):
             raise RuntimeError("Generated training script did not produce training metrics.")
         if not artifacts.model_path.exists():
             raise RuntimeError("Generated training script did not produce model checkpoint.")
+
+        # Generated training code may save a torch-native checkpoint that is not
+        # compatible with CheckpointClassifier.load(). If so, regenerate outputs
+        # with the built-in deterministic training entrypoint.
+        try:
+            CheckpointClassifier.load(artifacts.model_path)
+        except Exception as error:
+            config_path = self.output_dir / "training_job_config.json"
+            run_training_job(config_path)
+            self._record_log(
+                "Generated checkpoint format was incompatible; regenerated checkpoint via built-in run_training_job.",
+                logs,
+            )
+            try:
+                CheckpointClassifier.load(artifacts.model_path)
+            except Exception as second_error:
+                raise RuntimeError(
+                    "Training produced an incompatible model checkpoint format. "
+                    "Expected CheckpointClassifier-compatible payload."
+                ) from second_error
 
         metrics = json.loads(artifacts.training_metrics_path.read_text(encoding="utf-8"))
         self._record_log(
@@ -997,6 +1046,7 @@ class ActiveLearningAgent(BaseAgent):
         instructions = (
             "You are a model-training coding agent. "
             "Write robust Python code, run it, inspect runtime outputs, and refine until training succeeds. "
+            "Do not use Python `with` context managers in generated code because the local executor may fail on them. "
             "You must produce the requested files and end with strict JSON in final_answer."
         )
         max_steps = max(1, int(self.agent_max_steps))
@@ -1004,13 +1054,22 @@ class ActiveLearningAgent(BaseAgent):
             tools=tools,
             model=model,
             executor_type="local",
+            executor_kwargs={
+                "additional_functions": {
+                    "super": super,
+                }
+            },
             additional_authorized_imports=[
+                "fasttext",
+                "fasttext.*",
                 "json",
                 "pathlib",
                 "pickle",
                 "numpy",
+                "numpy.*",
                 "pandas",
                 "torch",
+                "torch.*",
             ],
             max_steps=max_steps,
             verbosity_level=1,
@@ -1043,7 +1102,10 @@ class ActiveLearningAgent(BaseAgent):
             "4) If first implementation fails, debug using errors and rerun.\n"
             "5) If blocked, use `github_code_search` first and `web_search` second to find reliable training patterns.\n"
             "6) Keep script deterministic with explicit random seeds.\n"
-            "7) Return final JSON with keys: success (bool), model_path, metrics_path, notes.\n"
+            "7) If using class-based models, prefer explicit `super(CurrentClass, self)` over zero-arg `super()`.\n"
+            "8) Do not use any `with` blocks (for example `with torch.no_grad()` or `with torch.inference_mode()`). "
+            "Run validation without context managers.\n"
+            "9) Return final JSON with keys: success (bool), model_path, metrics_path, notes.\n"
             "Use only Python code execution and finish with final_answer(json.dumps(...))."
         )
 

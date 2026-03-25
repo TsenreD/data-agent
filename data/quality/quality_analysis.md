@@ -14,24 +14,26 @@
 
 ## Why This Matters
 
-This is a math reasoning dataset where text (the problem statement) is the primary modality. Audio/image columns are entirely null and should be dropped. The 50% label null rate is not a data quality problem - it's a dataset design choice where different sources contribute different proportions of labeled vs unlabeled problems. The recommended strategy preserves all 100 rows because: (1) unlabeled math problems are still useful for evaluation, (2) they could be labeled later via model generation, (3) they provide source diversity. Class imbalance checks are irrelevant because the label is a numeric answer target (chain-of-thought with final answer), not a classification category. Numeric outlier detection on text length is misleading here - longer texts are simply more complex math problems, not errors.
+The hint suggested median imputation for missing values and drop for duplicates, but these are inappropriate for this text-based math reasoning dataset. Labels are structured solution chains (not simple numeric values to impute), and there are no duplicates to drop. The missing labels are not random - they follow source patterns (GSM8K has labels, other sources don't). This is a dataset collection characteristic, not a quality issue. The recommended strategy preserves all informative rows while removing irrelevant null columns (audio/image), which maximizes dataset utility for both training and evaluation purposes.
 
 ## Priority Actions
 
-- drop_null_modality_columns
-- preserve_unlabeled_math_problems
+- drop_irrelevant_columns
+- preserve_unlabeled_rows_for_evaluation
+- validate_label_format_consistency
 
 ## Relevant Checks
 
-- text_non_empty
-- label_format_consistency
-- source_distribution
+- text_non_empty - all 100 rows have valid text (min length 84)
+- label_format_validity - labels follow '#### <number>' format with reasoning chain
+- source_distribution - madrylab/gsm8k-platinum (50), all-russian (40), project-euler (10)
+- problem_diversity - different math problem types across sources
 
 ## Lower-Value Checks
 
-- class_balance
-- numeric_outliers
-- imbalance_ratio
+- class_balance plots - not applicable for numeric answer targets with high cardinality
+- numeric outlier detection - labels are solution text, not numeric features
+- imputation for missing labels - labels are structured solution chains, not simple numeric values to impute
 
 ## Alternative Strategies
 

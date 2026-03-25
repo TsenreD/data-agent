@@ -2,16 +2,16 @@
 
 ## Executive Summary
 
-- Missing values: `250`. Cells need imputation or row-level handling.
+- Missing values: `240`. Cells need imputation or row-level handling.
 - Duplicate rows: `0`. Rows may distort evaluation and training.
-- Numeric outliers: `11`. Values may need clipping, filtering, or review.
-- Label imbalance is tracked on `label`.
+- Numeric outliers: `0`. Values may need clipping, filtering, or review.
+- Label imbalance is tracked on `label` with majority share `0.020`.
 
 ## Key Metrics
 
-- Missing values: `250`
+- Missing values: `240`
 - Duplicate rows: `0`
-- Numeric outliers: `11`
+- Numeric outliers: `0`
 - Imbalance column: `label`
 
 ## What To Read First

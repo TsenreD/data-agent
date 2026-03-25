@@ -51,13 +51,17 @@ agents:
   active_learning:
     task_prompt: |
       Train classification model to determine whether text contains a full problem, or an incomplete one.
+      When label is none or "invalid", it is considered an incomplete problem (classification label 1),
+       otherwise classification label 0
       Use fasttext as base model, train a classification head on top.
+      Make sure to choose model size accordingly to the amount of available data.
+      Train for 5 epochs, bs=20.
     target_column: label
     feature_columns:
       - text
     strategy: entropy
     batch_size: 20
-    max_steps: 8
+    max_steps: 20
     test_size: 0.25
 
 
