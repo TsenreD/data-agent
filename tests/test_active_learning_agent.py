@@ -91,6 +91,7 @@ def test_active_learning_agent_selects_prompt_aligned_target_and_queries_pool(mo
                 "active_learning": {
                     "task_prompt": "Train classification model to determine whether text contains a full problem, or an incomplete one",
                     "batch_size": 2,
+                    "target_column": "has_complete_problem",
                     "model": {"epochs": 18, "dim": 32, "bucket_size": 2048},
                 }
             }
@@ -125,6 +126,7 @@ def test_active_learning_run_cycle_and_report(tmp_path) -> None:
                 "active_learning": {
                     "task_prompt": "Classify whether a text is complete or incomplete",
                     "batch_size": 2,
+                    "target_column": "has_complete_problem",
                     "model": {"epochs": 20, "dim": 24, "bucket_size": 1024},
                 }
             }
@@ -196,7 +198,7 @@ def test_active_learning_integrates_after_annotation_prompt(monkeypatch, tmp_pat
                     "task_prompt": "Train classification model to determine whether text contains a full problem, or an incomplete one",
                     "batch_size": 2,
                     "feature_columns": ["text"],
-                    "target_column": "label",
+                    "target_column": "annotation_label",
                     "model": {"epochs": 16, "dim": 24, "bucket_size": 1024},
                 },
             },
@@ -210,7 +212,7 @@ def test_active_learning_integrates_after_annotation_prompt(monkeypatch, tmp_pat
     runner = PipelineRunner([annotation, active])
     result = runner.run({"dataframe": frame})
 
-    assert result.metadata["active_learning"]["target_column"] == "label"
+    assert result.metadata["active_learning"]["target_column"] == "annotation_label"
     assert result.artifacts["annotated_dataset"] == str(output_dir / "annotation" / "annotated_dataset.jsonl")
     assert Path(result.artifacts["active_learning_dataset"]).exists()
     assert Path(result.artifacts["active_learning_model"]).exists()
@@ -269,3 +271,66 @@ def test_active_learning_trains_only_via_codeagent_execution(monkeypatch, tmp_pa
     result = agent.execute({"dataframe": frame})
     assert calls["codeagent"] == 1
     assert result.metadata["active_learning"]["metrics"]["backend"] == "torch"
+
+
+def test_active_learning_defaults_to_annotation_label_and_excludes_null_rows(monkeypatch, tmp_path) -> None:
+    frame = pd.DataFrame(
+        {
+            "text": [
+                "complete example one",
+                "incomplete example one",
+                "complete example two",
+                "needs human annotation",
+            ],
+            "annotation_label": ["complete", "incomplete", "complete", None],
+        }
+    )
+    agent = ActiveLearningAgent(
+        config={
+            "agents": {
+                "active_learning": {
+                    "task_prompt": "Classify complete vs incomplete text",
+                    "feature_columns": ["text"],
+                    "batch_size": 2,
+                }
+            }
+        },
+        output_dir=tmp_path / "data",
+    )
+    monkeypatch.setattr(agent, "_run_training_locally_with_code_agent", lambda **kwargs: _write_training_outputs(kwargs["artifacts"]))
+
+    result = agent.execute({"dataframe": frame})
+
+    assert result.metadata["active_learning"]["target_column"] == "annotation_label"
+    assert result.metadata["active_learning"]["labeled_rows"] == 3
+    assert result.metadata["active_learning"]["pool_rows"] == 1
+
+
+def test_active_learning_split_is_stratified_by_target(tmp_path) -> None:
+    frame = pd.DataFrame(
+        {
+            "text": [f"row {index}" for index in range(20)],
+            "annotation_label": ["complete"] * 10 + ["incomplete"] * 10,
+        }
+    )
+    agent = ActiveLearningAgent(
+        config={
+            "agents": {
+                "active_learning": {
+                    "task_prompt": "Classify complete vs incomplete text",
+                    "feature_columns": ["text"],
+                    "target_column": "annotation_label",
+                    "test_size": 0.3,
+                }
+            }
+        },
+        output_dir=tmp_path / "data",
+    )
+
+    train_df, val_df = agent._split_train_test(frame, "annotation_label")
+
+    assert not val_df.empty
+    train_counts = train_df["annotation_label"].value_counts().to_dict()
+    val_counts = val_df["annotation_label"].value_counts().to_dict()
+    assert set(train_counts.keys()) == {"complete", "incomplete"}
+    assert set(val_counts.keys()) == {"complete", "incomplete"}

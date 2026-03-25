@@ -1,303 +1,287 @@
 #!/usr/bin/env python3
 """
-Active Learning Classifier Training Script
-Trains a fasttext-based classifier to determine whether text contains a full problem or an incomplete one.
+Active Learning Training Script
+Train classification model to determine whether text contains a full problem, or an incomplete one.
+When annotation label is 1, problem is considered complete, with label 0 marking incomplete problems.
+Uses DeepPavlov/rubert-base-cased with a classification head on top.
 """
+
+from pathlib import Path
 import json
-import pathlib
 import random
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from collections import Counter
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import accuracy_score, f1_score
+import torch.nn.functional as F
 
-# Set random seeds for determinism
+# Set deterministic seed
 SEED = 13
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
+# Load config
+config_path = Path('/home/user/data-agent/data/active_learning/training_job_config.json')
+config = json.loads(config_path.read_text())
 
+# Paths
+train_path = Path(config['train_path'])
+val_path = Path(config['val_path'])
+model_path = Path(config['model_path'])
+metrics_path = Path(config['metrics_path'])
+
+# Hyperparameters
+EPOCHS = 5
+BATCH_SIZE = 20
+LEARNING_RATE = 2e-4
+MAX_LEN = 256
+
+print("Config loaded:")
+print(f"  train_path: {train_path}")
+print(f"  val_path: {val_path}")
+print(f"  model_path: {model_path}")
+print(f"  metrics_path: {metrics_path}")
+print(f"  epochs: {EPOCHS}, batch_size: {BATCH_SIZE}")
+
+# Load data from JSONL files
 def load_jsonl(path):
-    """Load JSONL file."""
-    content = pathlib.Path(path).read_text()
-    lines = content.strip().split('\n')
+    lines = path.read_text().strip().split('\n')
     data = []
     for line in lines:
-        if line.strip():
+        if line:
             data.append(json.loads(line))
     return data
 
+train_data = load_jsonl(train_path)
+val_data = load_jsonl(val_path)
 
-def get_label(label):
-    """Convert label to binary: 1 if incomplete (none/invalid), 0 otherwise."""
-    if label is None:
-        return 1
-    if isinstance(label, str):
-        lower_label = label.lower()
-        if lower_label == 'none' or lower_label == 'invalid':
-            return 1
-    return 0
+print(f"Train samples: {len(train_data)}")
+print(f"Val samples: {len(val_data)}")
 
-
-def tokenize(text):
-    """Simple character-level tokenization for fasttext-style embeddings."""
-    text = text.lower()
-    tokens = []
-    text_padded = '<' + text + '>'
-    for n in range(3, 7):
-        for i in range(len(text_padded) - n + 1):
-            tokens.append(text_padded[i:i+n])
-    return tokens
-
-
+# Create dataset class
 class TextDataset(Dataset):
-    """Custom Dataset for text classification."""
-    
-    def __init__(self, texts, labels, vocab, max_len=256):
-        self.texts = texts
-        self.labels = labels
-        self.vocab = vocab
+    def __init__(self, data, tokenizer, max_len):
+        self.data = data
+        self.tokenizer = tokenizer
         self.max_len = max_len
     
     def __len__(self):
-        return len(self.texts)
+        return len(self.data)
     
     def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-        indices = self.text_to_indices(text)
-        return torch.tensor(indices, dtype=torch.long), torch.tensor(label, dtype=torch.long)
-    
-    def text_to_indices(self, text):
-        tokens = tokenize(text)
-        indices = [self.vocab.get(t, self.vocab['<unk>']) for t in tokens]
-        # Pad or truncate
-        if len(indices) < self.max_len:
-            indices = indices + [self.vocab['<pad>']] * (self.max_len - len(indices))
-        else:
-            indices = indices[:self.max_len]
-        return indices
-
-
-class FastTextClassifier(nn.Module):
-    """FastText-style classifier with classification head."""
-    
-    def __init__(self, vocab_size, embedding_dim=100, hidden_dim=64, num_classes=2):
-        super(FastTextClassifier, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
-        self.fc1 = nn.Linear(embedding_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, num_classes)
-        self.dropout = nn.Dropout(0.3)
+        item = self.data[idx]
+        text = item['text'][:5000]  # Truncate very long texts
+        label = int(item['annotation_label'])
         
-    def forward(self, x):
-        # x: (batch, seq_len)
-        embedded = self.embedding(x)  # (batch, seq_len, embed_dim)
-        # Mask padding
-        mask = (x != 0).float().unsqueeze(-1)  # (batch, seq_len, 1)
-        embedded = embedded * mask
-        # Average pooling
-        summed = embedded.sum(dim=1)  # (batch, embed_dim)
-        lengths = mask.sum(dim=1).clamp(min=1)  # (batch, 1)
-        pooled = summed / lengths  # (batch, embed_dim)
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
         
-        # Classification head
-        x = torch.relu(self.fc1(pooled))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
 
+# Load tokenizer and model
+model_name = "DeepPavlov/rubert-base-cased"
+print(f"Loading tokenizer: {model_name}")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-def train_epoch(model, loader, criterion, optimizer):
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
+print(f"Loading model: {model_name}")
+base_model = AutoModel.from_pretrained(model_name)
+
+# Freeze all model parameters
+for param in base_model.parameters():
+    param.requires_grad = False
+
+# Get hidden size
+hidden_size = base_model.config.hidden_size
+print(f"Hidden size: {hidden_size}")
+
+# Create datasets and dataloaders
+train_dataset = TextDataset(train_data, tokenizer, MAX_LEN)
+val_dataset = TextDataset(val_data, tokenizer, MAX_LEN)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+print(f"Train batches: {len(train_loader)}")
+print(f"Val batches: {len(val_loader)}")
+
+# Setup training
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+base_model = base_model.to(device)
+
+# Use class weights for imbalanced data
+class_counts = [98, 2]  # positive, negative
+total = sum(class_counts)
+class_weights = torch.tensor([total / (2 * c) for c in class_counts], dtype=torch.float32).to(device)
+print(f"Class weights: {class_weights}")
+
+# Create classifier
+classifier_layer = torch.nn.Linear(hidden_size, 2).to(device)
+optimizer = torch.optim.Adam(classifier_layer.parameters(), lr=LEARNING_RATE)
+
+# Set models to eval mode
+base_model.eval()
+classifier_layer.train()
+
+loss_history = []
+best_val_loss = float('inf')
+
+print("Starting training...")
+
+for epoch in range(EPOCHS):
+    train_loss_total = 0
+    num_batches = 0
     
-    for batch_idx, (texts, labels) in enumerate(loader):
+    # Training loop - use iterator
+    train_iter = iter(train_loader)
+    while True:
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            break
+            
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+        
         optimizer.zero_grad()
-        outputs = model(texts)
-        loss = criterion(outputs, labels)
+        
+        # Get BERT outputs
+        outputs = base_model(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]
+        
+        # Classifier
+        logits = classifier_layer(cls_output)
+        
+        # Loss
+        loss = F.cross_entropy(logits, labels, weight=class_weights)
+        
+        # Backward
         loss.backward()
         optimizer.step()
         
-        total_loss += loss.item()
-        _, predicted = torch.max(outputs, 1)
-        correct += (predicted == labels).sum().item()
-        total += labels.size(0)
+        train_loss_total += loss.item()
+        num_batches += 1
     
-    return total_loss / len(loader), correct / total
-
-
-def evaluate(model, loader, criterion):
-    """Evaluate the model."""
-    model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
+    train_loss = train_loss_total / num_batches
+    
+    # Validation
+    val_loss_total = 0
     all_preds = []
     all_labels = []
     
-    for texts, labels in loader:
-        outputs = model(texts)
-        loss = criterion(outputs, labels)
+    val_iter = iter(val_loader)
+    while True:
+        try:
+            batch = next(val_iter)
+        except StopIteration:
+            break
+            
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
         
-        total_loss += loss.item()
-        _, predicted = torch.max(outputs, 1)
-        correct += (predicted == labels).sum().item()
-        total += labels.size(0)
+        outputs = base_model(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]
+        logits = classifier_layer(cls_output)
         
-        all_preds.extend(predicted.cpu().numpy())
+        loss = F.cross_entropy(logits, labels, weight=class_weights)
+        val_loss_total += loss.item()
+        
+        preds = torch.argmax(logits, dim=1)
+        all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
     
-    return total_loss / len(loader), correct / total, all_preds, all_labels
+    val_loss = val_loss_total / len(val_loader)
+    val_acc = accuracy_score(all_labels, all_preds)
+    val_f1 = f1_score(all_labels, all_preds, average='macro')
+    
+    loss_history.append({
+        'epoch': epoch + 1,
+        'train_loss': train_loss,
+        'val_loss': val_loss
+    })
+    
+    print(f"Epoch {epoch+1}/{EPOCHS}")
+    print(f"  Train Loss: {train_loss:.4f}")
+    print(f"  Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, Macro F1: {val_f1:.4f}")
+    
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(classifier_layer.state_dict(), str(model_path))
+        print(f"  -> Model saved")
 
+print("Training complete!")
 
-def main():
-    # Read config
-    config_path = pathlib.Path('/home/user/data-agent/data/active_learning/training_job_config.json')
-    config_content = config_path.read_text()
-    config = json.loads(config_content)
-    
-    print("Config loaded:")
-    print(f"  train_path: {config['train_path']}")
-    print(f"  val_path: {config['val_path']}")
-    print(f"  task_prompt: {config['task_prompt'][:100]}...")
-    print(f"  model_path: {config['model_path']}")
-    print(f"  metrics_path: {config['metrics_path']}")
-    print(f"  random_seed: {config['random_seed']}")
-    
-    # Load data
-    train_data = load_jsonl(config['train_path'])
-    val_data = load_jsonl(config['val_path'])
-    
-    print(f"\nLoaded {len(train_data)} training samples, {len(val_data)} validation samples")
-    
-    # Process data
-    train_texts = []
-    train_labels = []
-    for item in train_data:
-        text = item.get('text', '')
-        label = item.get('label', None)
-        binary_label = get_label(label)
-        train_texts.append(text)
-        train_labels.append(binary_label)
-    
-    val_texts = []
-    val_labels = []
-    for item in val_data:
-        text = item.get('text', '')
-        label = item.get('label', None)
-        binary_label = get_label(label)
-        val_texts.append(text)
-        val_labels.append(binary_label)
-    
-    print(f"Training label distribution: 0={train_labels.count(0)}, 1={train_labels.count(1)}")
-    print(f"Validation label distribution: 0={val_labels.count(0)}, 1={val_labels.count(1)}")
-    
-    # Task prompt for context
-    task_prompt = config['task_prompt']
-    print(f"\nTask prompt: {task_prompt[:200]}...")
-    
-    # Build vocabulary from training data
-    word_counts = Counter()
-    for text in train_texts:
-        tokens = tokenize(text)
-        word_counts.update(tokens)
-    
-    # Keep most common words (vocab size based on small dataset)
-    vocab_size = min(5000, len(word_counts))
-    most_common = word_counts.most_common(vocab_size)
-    vocab = {word: idx + 2 for idx, (word, _) in enumerate(most_common)}
-    vocab['<pad>'] = 0
-    vocab['<unk>'] = 1
-    
-    print(f"Vocabulary size: {len(vocab)}")
-    
-    # Create datasets
-    train_dataset = TextDataset(train_texts, train_labels, vocab)
-    val_dataset = TextDataset(val_texts, val_labels, vocab)
-    
-    # Create data loaders
-    batch_size = 20
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-    
-    print(f"Training batches: {len(train_loader)}, Validation batches: {len(val_loader)}")
-    
-    # Initialize model - small size for small dataset
-    model = FastTextClassifier(
-        vocab_size=len(vocab),
-        embedding_dim=100,
-        hidden_dim=64,
-        num_classes=2
-    )
-    
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-    
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    # Training loop
-    num_epochs = 5
-    best_val_acc = 0
-    metrics = {
-        'train_loss': [],
-        'train_acc': [],
-        'val_loss': [],
-        'val_acc': [],
-        'epoch': []
-    }
-    
-    print("\nStarting training...")
-    for epoch in range(num_epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_acc, val_preds, val_labels_list = evaluate(model, val_loader, criterion)
+# Final evaluation on validation set
+base_model.eval()
+classifier_layer.load_state_dict(torch.load(str(model_path)))
+
+all_preds = []
+all_labels = []
+
+val_iter = iter(val_loader)
+while True:
+    try:
+        batch = next(val_iter)
+    except StopIteration:
+        break
         
-        metrics['epoch'].append(epoch + 1)
-        metrics['train_loss'].append(train_loss)
-        metrics['train_acc'].append(train_acc)
-        metrics['val_loss'].append(val_loss)
-        metrics['val_acc'].append(val_acc)
-        
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            # Save best model
-            torch.save(model.state_dict(), config['model_path'])
-            print(f"  -> Saved best model with val_acc: {val_acc:.4f}")
+    input_ids = batch['input_ids'].to(device)
+    attention_mask = batch['attention_mask'].to(device)
+    labels = batch['label'].to(device)
     
-    # Final evaluation
-    final_val_loss, final_val_acc, final_preds, final_labels = evaluate(model, val_loader, criterion)
-    print(f"\nFinal validation accuracy: {final_val_acc:.4f}")
+    outputs = base_model(input_ids=input_ids, attention_mask=attention_mask)
+    cls_output = outputs.last_hidden_state[:, 0, :]
+    logits = classifier_layer(cls_output)
     
-    # Save metrics
-    metrics['final_val_acc'] = final_val_acc
-    metrics['final_val_loss'] = final_val_loss
-    metrics['best_val_acc'] = best_val_acc
-    
-    # Write metrics to JSON
-    metrics_path = pathlib.Path(config['metrics_path'])
-    metrics_path.write_text(json.dumps(metrics, indent=2))
-    print(f"Metrics saved to {config['metrics_path']}")
-    
-    print("\nTraining complete!")
-    
-    return {
-        'success': True,
-        'model_path': config['model_path'],
-        'metrics_path': config['metrics_path'],
-        'notes': f'Trained fasttext classifier for {num_epochs} epochs with batch size {batch_size}. Best validation accuracy: {best_val_acc:.4f}'
-    }
+    preds = torch.argmax(logits, dim=1)
+    all_preds.extend(preds.cpu().numpy())
+    all_labels.extend(labels.cpu().numpy())
 
+final_accuracy = accuracy_score(all_labels, all_preds)
+final_f1 = f1_score(all_labels, all_preds, average='macro')
 
-if __name__ == '__main__':
-    result = main()
-    print("\nFinal result:")
-    print(json.dumps(result, indent=2))
+print(f"Final metrics:")
+print(f"  Accuracy: {final_accuracy}")
+print(f"  Macro F1: {final_f1}")
+
+# Create metrics JSON
+metrics = {
+    "accuracy": final_accuracy,
+    "macro_f1": final_f1,
+    "evaluated_rows": len(val_data),
+    "train_rows": len(train_data),
+    "val_rows": len(val_data),
+    "backend": "DeepPavlov/rubert-base-cased",
+    "loss_history": loss_history
+}
+
+# Save metrics
+metrics_path.write_text(json.dumps(metrics, indent=2))
+print(f"\nMetrics saved to: {metrics_path}")
+
+# Verify files exist
+print(f"\nVerifying output files:")
+print(f"  Model path exists: {model_path.exists()}")
+print(f"  Metrics path exists: {metrics_path.exists()}")
+
+if model_path.exists():
+    print(f"  Model file size: {model_path.stat().st_size} bytes")
+
+print("\nDone!")

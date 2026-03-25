@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 import pandas as pd
@@ -427,13 +428,14 @@ def test_annotation_prompt_from_config_can_add_new_fields(monkeypatch, tmp_path)
     assert result.dataframe is not None
     assert result.metadata["annotation"]["prompt"] is not None
     assert "has_complete_problem" in result.dataframe.columns
+    assert "annotation_label" in result.dataframe.columns
     assert result.dataframe.loc[0, "label"] == "42"
     assert bool(result.dataframe.loc[0, "has_complete_problem"]) is True
     assert pd.isna(result.dataframe.loc[1, "label"])
     assert bool(result.dataframe.loc[1, "has_complete_problem"]) is False
-    assert bool(result.dataframe.loc[1, "annotation_needs_review"]) is False
+    assert bool(result.dataframe.loc[1, "annotation_needs_review"]) is True
     assert result.dataframe.loc[2, "label"] == "7"
-    assert result.dataframe.loc[2, "annotation_label_origin"] == "existing"
+    assert result.dataframe.loc[2, "annotation_label_origin"] in {"agreed_llm", "unresolved"}
 
 
 def test_annotation_quality_reports_inter_expert_and_intra_agreement(tmp_path) -> None:
@@ -560,7 +562,7 @@ def test_prompt_rows_that_fail_model_processing_stay_unresolved(monkeypatch, tmp
     assert bool(result.dataframe.loc[0, "annotation_needs_review"]) is True
     assert bool(result.dataframe.loc[1, "has_complete_problem"]) is True
     assert result.dataframe.loc[1, "label"] == "42"
-    assert result.dataframe.loc[1, "annotation_label_origin"] == "prompt"
+    assert result.dataframe.loc[1, "annotation_label_origin"] == "agreed_llm"
 
 
 def test_annotation_agent_caps_parallelism_for_remote_models(tmp_path) -> None:
@@ -656,7 +658,7 @@ def test_annotation_prompt_uses_direct_row_transform_path(monkeypatch, tmp_path)
     assert bool(result.dataframe.loc[0, "has_complete_problem"]) is True
     assert pd.isna(result.dataframe.loc[1, "label"])
     assert bool(result.dataframe.loc[1, "has_complete_problem"]) is False
-    assert bool(result.dataframe.loc[1, "annotation_needs_review"]) is False
+    assert bool(result.dataframe.loc[1, "annotation_needs_review"]) is True
 
 
 def test_annotation_agent_does_not_guess_high_cardinality_numeric_labels(tmp_path) -> None:
@@ -674,3 +676,31 @@ def test_annotation_agent_does_not_guess_high_cardinality_numeric_labels(tmp_pat
     assert labeled["label"].iloc[:30].tolist() == [str(index) for index in range(1, 31)]
     assert labeled["label"].iloc[30:].isna().all()
     assert set(labeled["annotation_label_origin"].iloc[30:].tolist()) == {"unresolved"}
+
+
+def test_annotation_disagreement_sets_annotation_label_null_and_exports_review(monkeypatch, tmp_path) -> None:
+    frame = pd.DataFrame(
+        {
+            "text": ["Ambiguous row"],
+            "label": [None],
+            "source": ["demo"],
+        }
+    )
+    agent = DataAnnotationAgent(config={"project": {"modality": "text"}}, output_dir=tmp_path)
+
+    def fake_run_annotation_pass(*, rows, pass_name, prompt, fewshot_samples):
+        if pass_name == "pass_1":
+            return SimpleNamespace(raw_responses=[{"answer": "class_a"}], logs=[])
+        return SimpleNamespace(raw_responses=[{"answer": "class_b"}], logs=[])
+
+    monkeypatch.setattr(agent, "_run_annotation_pass", fake_run_annotation_pass)
+
+    result = agent.execute({"dataframe": frame})
+
+    assert result.dataframe is not None
+    assert pd.isna(result.dataframe.loc[0, "annotation_label"])
+    assert bool(result.dataframe.loc[0, "annotation_needs_review"]) is True
+
+    review_payload = json.loads(Path(result.artifacts["low_confidence_review"]).read_text(encoding="utf-8"))
+    assert len(review_payload) == 1
+    assert review_payload[0]["meta"]["needs_review"] is True

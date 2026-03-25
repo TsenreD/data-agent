@@ -41,22 +41,21 @@ agents:
   annotation:
     base_url: http://localhost:8000/v1/chat/completions
     prompt: |
-      Solve the text problem, put your answer in \boxed{}.
-      If a problem is incomplete (and has no solution), set label to "invalid".
+      Determine whether given problem contains enough information to be solvable.
+      If a problem is not missing crucial information, asnwer \boxed{1}
+      Otherwise answer \boxed{0}
     process_config:
-      parallel_workers: 50
+      parallel_workers: 150
       timeout_per_row: 600
       max_retries: 2
       max_tokens: 8192
   active_learning:
     task_prompt: |
       Train classification model to determine whether text contains a full problem, or an incomplete one.
-      When label is none or "invalid", it is considered an incomplete problem (classification label 1),
-       otherwise classification label 0
-      Use fasttext as base model, train a classification head on top.
+      When annotation label is 1, problem is considered complete, with label 0 marking incomplete problems.
+      Use DeepPavlov/rubert-base-cased, train ONLY a classification head on top.
       Make sure to choose model size accordingly to the amount of available data.
       Train for 5 epochs, bs=20.
-    target_column: label
     feature_columns:
       - text
     strategy: entropy
@@ -83,11 +82,10 @@ sources:
   - type: scrape 
     name: all-russian
     url: https://vos.olimpiada.ru/2025/invite/tasks
-    limit: 40
+    limit: 90
     allow_network: true
     extraction_instructions: |
       Extract one record per actual olympiad problem, not one record per year page.
       Follow child links when needed.
       Put the full problem statement in `text`.
       Preserve year, round, source_url, and solution_url when available.
-      Retain only mathematical and physical problems.

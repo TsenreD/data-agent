@@ -239,7 +239,7 @@ class DataAnnotationAgent(BaseAgent):
 
     def check_quality(self, df_labeled: pd.DataFrame) -> dict[str, Any]:
         label_column = self._resolved_label_column(df_labeled)
-        final_labels = df_labeled.get("annotation_auto_label", pd.Series([None] * len(df_labeled), index=df_labeled.index))
+        final_labels = df_labeled.get("annotation_label", pd.Series([None] * len(df_labeled), index=df_labeled.index))
         pass_1 = df_labeled.get("annotation_auto_label_pass_1", pd.Series([None] * len(df_labeled), index=df_labeled.index))
         pass_2 = df_labeled.get("annotation_auto_label_pass_2", pd.Series([None] * len(df_labeled), index=df_labeled.index))
         intra = self._compute_pairwise_agreement(pass_1, pass_2)
@@ -261,7 +261,7 @@ class DataAnnotationAgent(BaseAgent):
         confidence = pd.to_numeric(df_labeled.get("annotation_confidence"), errors="coerce").fillna(0.0)
         label_dist = (
             final_labels.dropna().astype(str).value_counts().to_dict()
-            if "annotation_auto_label" in df_labeled.columns
+            if "annotation_label" in df_labeled.columns
             else {}
         )
         review_count = int(df_labeled.get("annotation_needs_review", pd.Series(dtype=bool)).fillna(False).sum())
@@ -294,7 +294,6 @@ class DataAnnotationAgent(BaseAgent):
             working = df.copy()
 
         tasks: list[dict[str, Any]] = []
-        label_column = self._resolved_label_column(working)
         for index, (_, row) in enumerate(working.iterrows(), start=1):
             text_value = row.get("text")
             data = {"text": None if text_value is None else str(text_value)}
@@ -303,10 +302,10 @@ class DataAnnotationAgent(BaseAgent):
             for key in ("annotation_confidence", "annotation_label_origin"):
                 if key in working.columns:
                     data[key] = self._json_ready(row.get(key))
+            if "annotation_label" in working.columns:
+                data["annotation_label"] = self._json_ready(row.get("annotation_label"))
 
-            final_label = row.get("annotation_auto_label")
-            if final_label is None and label_column in working.columns:
-                final_label = row.get(label_column)
+            final_label = row.get("annotation_label")
             annotation_result = []
             if self._normalize_answer(final_label) is not None:
                 annotation_result.append(
@@ -395,18 +394,14 @@ class DataAnnotationAgent(BaseAgent):
                 f"Few-shot sample count: {len(fewshot_samples)}",
                 logs,
             )
-            rows_to_annotate_count = int((~existing_rows).sum())
+            rows_to_annotate_count = int(len(work_df))
             self._record_log(
-                f"Rows requiring annotation (missing labels): {rows_to_annotate_count} / {len(work_df)}",
+                f"Rows requiring annotation: {rows_to_annotate_count} / {len(work_df)}",
                 logs,
             )
 
         selected_payloads = self._build_selected_payloads(work_df, selected_columns)
-        missing_indices = [
-            index
-            for index, has_existing in enumerate(existing_rows.tolist())
-            if not bool(has_existing)
-        ]
+        missing_indices = list(range(len(work_df)))
         selected_payloads_missing = [selected_payloads[index] for index in missing_indices]
 
         pass_1_missing = self._run_annotation_pass(
@@ -459,11 +454,9 @@ class DataAnnotationAgent(BaseAgent):
         work_df["annotation_extracted_answer_1"] = parsed_1.get("answers", [None] * len(work_df))
         work_df["annotation_extracted_answer_2"] = parsed_2.get("answers", [None] * len(work_df))
 
-        existing_label_values = work_df[self._resolved_label_column(work_df)].copy()
         finalized = self._finalize_annotations(
             work_df,
             existing_rows=existing_rows,
-            existing_label_values=existing_label_values,
             logs=logs,
         )
         return finalized, {"selected_columns": selected_columns, "fewshot_samples": fewshot_samples}
@@ -607,10 +600,8 @@ class DataAnnotationAgent(BaseAgent):
         df: pd.DataFrame,
         *,
         existing_rows: pd.Series,
-        existing_label_values: pd.Series,
         logs: list[str] | None,
     ) -> pd.DataFrame:
-        label_column = self._resolved_label_column(df)
         answer_1 = df["annotation_extracted_answer_1"].apply(self._normalize_answer)
         answer_2 = df["annotation_extracted_answer_2"].apply(self._normalize_answer)
 
@@ -627,7 +618,7 @@ class DataAnnotationAgent(BaseAgent):
         agreement_decisions = self._llm_compare_pass_answers(
             answer_1=answer_1.tolist(),
             answer_2=answer_2.tolist(),
-            compare_mask=[not bool(item) for item in existing_rows.tolist()],
+            compare_mask=[True] * len(existing_rows),
             logs=logs,
         )
 
@@ -645,11 +636,7 @@ class DataAnnotationAgent(BaseAgent):
             llm_final_label = self._normalize_answer(agreement_decision.get("final_label"))
             compare_failed = compare_status == "error"
 
-            if bool(existing_rows.iloc[idx]):
-                final_label = self._normalize_answer(existing_label_values.iloc[idx])
-                label_origin = "existing"
-                row_confidence = 1.0 if not compare_failed else 0.0
-            elif compare_failed:
+            if compare_failed:
                 final_label = None
                 label_origin = "unresolved"
                 row_confidence = 0.0
@@ -676,6 +663,7 @@ class DataAnnotationAgent(BaseAgent):
         df["annotation_auto_label_pass_1"] = pass_1_labels
         df["annotation_auto_label_pass_2"] = pass_2_labels
         df["annotation_auto_label"] = auto_labels
+        df["annotation_label"] = auto_labels
         df["annotation_label_origin"] = label_origins
         df["annotation_intra_agreement"] = intra_agreement
         df["annotation_confidence"] = confidence
@@ -683,9 +671,6 @@ class DataAnnotationAgent(BaseAgent):
         df["annotation_compare_status"] = compare_statuses
         df["annotation_compare_error"] = compare_errors
 
-        for idx, final_label in enumerate(auto_labels):
-            if final_label is not None and not bool(existing_rows.iloc[idx]):
-                df.at[df.index[idx], label_column] = final_label
         return df
 
     def _llm_compare_pass_answers(
@@ -924,7 +909,9 @@ class DataAnnotationAgent(BaseAgent):
         return None
 
     def _examples_for_label(self, df: pd.DataFrame, label_value: str) -> list[str]:
-        if "annotation_auto_label" in df.columns:
+        if "annotation_label" in df.columns:
+            subset = df[df["annotation_label"].astype(str) == label_value]
+        elif "annotation_auto_label" in df.columns:
             subset = df[df["annotation_auto_label"].astype(str) == label_value]
         elif self.label_column in df.columns:
             subset = df[df[self.label_column].astype(str) == label_value]
