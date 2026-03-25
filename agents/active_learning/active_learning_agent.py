@@ -35,6 +35,7 @@ DEFAULT_SCRIPT_PATH = "train_active_learning.py"
 DEFAULT_MODEL_PATH = "model.pth"
 DEFAULT_TRAINING_METRICS_PATH = "training_metrics.json"
 DEFAULT_AGENT_MAX_STEPS = 8
+DEFAULT_EXECUTION_TIMEOUT_SECONDS = 60
 DEFAULT_ANNOTATION_TARGET_COLUMN = "annotation_label"
 
 
@@ -106,6 +107,9 @@ class ActiveLearningAgent(BaseAgent):
         self.test_size = float(self.active_config.get("test_size", 0.25))
         self.random_seed = int(self.active_config.get("random_seed", 13))
         self.agent_max_steps = int(self.active_config.get("max_steps", DEFAULT_AGENT_MAX_STEPS))
+        self.execution_timeout_seconds = int(
+            self.active_config.get("execution_timeout_seconds", DEFAULT_EXECUTION_TIMEOUT_SECONDS)
+        )
 
     def run(self, dataframe: pd.DataFrame, task_prompt: str | None = None) -> pd.DataFrame:
         result = self.execute({"dataframe": dataframe, "task_prompt": task_prompt or self.task_prompt})
@@ -545,6 +549,7 @@ class ActiveLearningAgent(BaseAgent):
             model=model,
             executor_type="local",
             executor_kwargs={
+                "timeout_seconds": max(1, int(self.execution_timeout_seconds)),
                 "additional_functions": {
                     "super": super,
                 }
@@ -603,6 +608,7 @@ class ActiveLearningAgent(BaseAgent):
             "5) Write model artifact to `model_path` and metrics JSON to `metrics_path` from config.\n"
             "6) Metrics JSON MUST include: accuracy, macro_f1, evaluated_rows, train_rows, val_rows, backend, loss_history.\n"
             "7) `loss_history` MUST be a per-epoch list of {epoch, train_loss, val_loss}.\n"
+            "8) Don't use with torch.no_grad() and other context managers, since they break agentic harness.\n"
             "8) Execute the script and verify output files exist before final answer.\n"
             "9) Return final JSON with keys: success (bool), model_path, metrics_path, history, notes."
         )

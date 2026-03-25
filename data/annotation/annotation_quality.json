@@ -5,14 +5,14 @@
   "inter_expert_kappa": null,
   "inter_expert_agreement_pct": null,
   "inter_expert_agreement_rate": null,
-  "intra_agreement_kappa": 0.13087934560327208,
-  "intra_agreement_pct": 88.66666666666667,
-  "intra_agreement_rate": 0.8866666666666667,
+  "intra_agreement_kappa": 0.5018094089264173,
+  "intra_agreement_pct": 94.0677966101695,
+  "intra_agreement_rate": 0.940677966101695,
   "label_dist": {
-    "1": 131,
-    "0": 2
+    "1": 107,
+    "0": 4
   },
-  "confidence_mean": 0.8866666666666667,
-  "review_count": 17,
-  "review_rate": 0.11333333333333333
+  "confidence_mean": 0.9327731092436975,
+  "review_count": 8,
+  "review_rate": 0.06722689075630252
 }

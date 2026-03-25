@@ -1,63 +1,53 @@
-# Data Collection and Quality Agents
+# data-agent
 
-This repository contains a `DataCollectionAgent` that collects data from multiple sources, normalizes it into a fixed schema, persists the merged dataset, and generates an executable EDA notebook. A `DataAnnotationAgent` then auto-labels rows, generates an annotation spec, exports Label Studio tasks, flags low-confidence samples for review, and exposes a deterministic `process(df_path, prompt)` tool for LLM-driven row transformations. A `ActiveLearningAgent` can inspect the task prompt, choose feature and target columns, prepare train/val/pool datasets, and train a classifier via local `smolagents.CodeAgent` execution. A final `DataQualityAgent` detects common quality issues, applies configurable cleaning strategies, persists a cleaned dataset, and appends a quality review section into the notebook.
+Local multi-stage data pipeline with agent components for collection, annotation, active learning, and quality checks.
 
-Collection, quality, notebook inspection/generation, and active-learning training are agentic and run with `smolagents.CodeAgent(executor_type="local")`.
+## What this repo does
 
-## Architecture
+The project defines agent stages that can be run sequentially through a CLI pipeline:
 
-The project uses a sequential pipeline:
+- `DataCollectionAgent`: collect + normalize rows from configured sources.
+- `DataAnnotationAgent`: produce annotation artifacts, confidence/review flags, and Label Studio export payloads.
+- `ActiveLearningAgent`: orchestrate deterministic split + CodeAgent-driven training + epoch loss reporting.
+- `DataQualityAgent`: detect/fix data quality issues and persist cleaned outputs.
 
-- `PipelineRunner` orchestrates agents one at a time.
-- `DataCollectionAgent` handles source planning, collection, normalization, merge, persistence, and notebook generation.
-- `DataAnnotationAgent` consumes the unified dataset, infers labels with confidence scores, writes annotation artifacts, supports deterministic Label Studio exports, and can apply staged LLM row processing to a dataset on disk.
-- `ActiveLearningAgent` consumes the latest dataframe, infers feature/supervision columns from a task prompt, writes runnable training code, executes training locally via CodeAgent, and writes uncertainty-ranked review queues.
-- `DataQualityAgent` consumes the collected dataframe, reports missing values / duplicates / outliers / class imbalance, cleans the dataset, and updates notebook artifacts.
-- `SmolagentsCollectionBackend`, `SmolagentsNotebookBackend`, and `SmolagentsQualityBackend` run agentic workflows via local execution.
+Pipeline handoff is done through `AgentResult` payloads and artifact paths.
 
-## Unified schema
+## Local launch flow
 
-Collected rows are normalized to:
+### 1) Clone
 
-- `text`
-- `audio`
-- `image`
-- `label`
-- `source`
-- `collected_at`
-- `metadata`
+```bash
+git clone <YOUR_REPO_URL>
+cd data-agent
+```
 
-## Install
-
-Create a Python 3.11 virtual environment and install the package:
+### 2) Create environment and install
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install .
+python -m pip install -e .
 ```
 
-For local development:
+### 3) Configure
 
-```bash
-python -m pip install -e ".[dev]"
-```
+Edit `config.yaml`:
 
-Local skill files are packaged in the repo:
+- `llm.base_url`, `llm.model`, `llm.api_key`
+- `agents.*` settings
+- `sources` list
 
-- [agents/data_collection/skills/data_collection/SKILL.md](/Users/eadyagin/vscode/data-agent/agents/data_collection/skills/data_collection/SKILL.md)
-- [agents/data_collection/skills/eda_inspection/SKILL.md](/Users/eadyagin/vscode/data-agent/agents/data_collection/skills/eda_inspection/SKILL.md)
-- [agents/data_collection/skills/eda_notebook/SKILL.md](/Users/eadyagin/vscode/data-agent/agents/data_collection/skills/eda_notebook/SKILL.md)
-- [agents/data_quality/skills/detect_issues/SKILL.md](/Users/eadyagin/vscode/data-agent/agents/data_quality/skills/detect_issues/SKILL.md)
-- [agents/data_quality/skills/fix/SKILL.md](/Users/eadyagin/vscode/data-agent/agents/data_quality/skills/fix/SKILL.md)
-- [agents/data_quality/skills/compare/SKILL.md](/Users/eadyagin/vscode/data-agent/agents/data_quality/skills/compare/SKILL.md)
+Important:
+- Do not commit real API tokens. Use env vars or local-only config values.
+- If you already committed a token, rotate it.
 
-## Run
+### 4) Launch from CLI
 
 ```bash
 source .venv/bin/activate
-MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml
+MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml --output-dir data
 ```
 
 Optional preview:
@@ -66,51 +56,133 @@ Optional preview:
 MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml --print-head 5
 ```
 
-Run from Python:
+CLI args:
 
-```python
-from agents import DataCollectionAgent
+- `--config`: config file path (default `config.yaml`)
+- `--output-dir`: artifact root (default `data`)
+- `--print-head N`: print first `N` rows after run
 
-agent = DataCollectionAgent(config="config.yaml")
-df = agent.run()
-print(df.head())
+## Current runner behavior
+
+`cli.py` controls which stages are active in `build_runner()`.
+
+At the moment, only the `active_learning` stage is enabled in the default CLI path, and collection/quality/annotation lines are commented out.
+
+If you want full sequential flow, enable those blocks in `build_runner()`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    CFG[config.yaml] --> CLI[data-agent CLI]
+    CLI --> PR[PipelineRunner]
+
+    PR --> C[DataCollectionAgent]
+    C --> A[DataAnnotationAgent]
+    A --> AL[ActiveLearningAgent]
+    AL --> Q[DataQualityAgent]
+
+    C --> OC[data/collection/*]
+    A --> OA[data/annotation/*]
+    AL --> OAL[data/active_learning/*]
+    Q --> OQ[data/quality/*]
+
+    C -. AgentResult .-> A
+    A -. AgentResult .-> AL
+    AL -. AgentResult .-> Q
 ```
 
-Runtime prerequisites:
+### Core abstractions
 
-- an OpenAI-compatible model endpoint must be available at `llm.base_url`
-- web-enabled sources require outbound network access from the local Python process
-- browser-based scraping may require local Chromium/Chrome and matching driver binaries
+- `BaseAgent`: each stage implements `execute(payload) -> AgentResult`
+- `AgentResult`: dataframe + schema + metrics + artifacts + logs + metadata
+- `PipelineRunner`: runs a list of agents sequentially, passing prior result as next payload
 
-## Source configuration
+### Data flow (conceptual)
 
-Supported source types:
+1. Collection stage writes unified dataset
+2. Annotation stage writes labeled/review artifacts
+3. Active learning stage consumes labeled rows, creates train/val/pool, runs training orchestration
+4. Quality stage validates/fixes and writes cleaned outputs
 
-- `hf_dataset`
-- `api`
-- `scrape` via local `smolagents.CodeAgent` with model-generated Python scraping code
-- `kaggle_dataset` using a local exported file via `file_path`
+### Active learning design (current)
 
-For agentic sources, attempt history is returned in `AgentResult.metadata["source_attempts"]`.
-Configure per-agent defaults under `agents.collection`, `agents.eda`, `agents.annotation`, `agents.active_learning`, and `agents.quality`.
+- Deterministic split (`random_seed`, stratified by target column)
+- Script/code generation and execution delegated to CodeAgent
+- Metrics must include per-epoch `loss_history`
+- Report plots `train_loss` and `val_loss` against `epoch`
 
-Active-learning execution now uses `agents.active_learning.max_steps` for local CodeAgent step budget.
+## Repository layout
 
-For `scrape` sources, `allow_network: false` is best-effort instruction-level behavior in local execution (not OS-level network isolation).
+```text
+agents/
+  base.py
+  pipeline.py
+  data_collection/
+  data_annotation/
+  active_learning/
+  data_quality/
+models/
+cli.py
+config.yaml
+tests/
+```
 
 ## Outputs
 
-Running the pipeline writes outputs under `data/`:
+Under `data/` (or your `--output-dir`):
 
-- collection artifacts to `data/collection/`
-- annotation artifacts to `data/annotation/`
-- active learning artifacts to `data/active_learning/`
-- quality artifacts to `data/quality/`
+- `collection/`
+- `annotation/`
+- `active_learning/`
+- `quality/`
 
-The EDA notebook is generated at runtime. The notebook backend first inspects the real dataset via local Python execution, then notebook generation uses that summary; the quality agent appends a deterministic review section.
+Typical active-learning artifacts:
 
-## Limitations
+- `train.jsonl`, `val.jsonl`, `pool.jsonl`
+- `training_job_config.json`
+- `training_metrics.json`
+- model artifact (`model_path` from config)
+- `active_learning_curve.png`
 
-- Kaggle support is intentionally narrow in v1 and expects a local export path.
-- Audio and image EDA are left as the next increment.
-- Web search / page extraction quality still depends on source structure and model quality.
+## Development workflow
+
+Install dev deps:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+Run a file-level syntax check quickly:
+
+```bash
+python -m py_compile agents/active_learning/active_learning_agent.py
+```
+
+## Troubleshooting
+
+### `target_column` is wrong in training config
+
+If `training_job_config.json` shows an unexpected target, check `agents.active_learning.target_column` in `config.yaml`.
+
+### CodeAgent import errors (authorized modules)
+
+The executor only allows modules listed in `additional_authorized_imports` in active-learning code.
+
+### Missing dependencies inside runtime
+
+Install project dependencies in the same environment used to launch CLI.
+
+## README best-practice notes for this repo
+
+- Keep quickstart command-first and copy-paste safe.
+- Document defaults and current behavior (especially staged pipeline toggles).
+- Call out secrets handling explicitly.
+- Keep artifact paths and config keys versioned with code changes.
+- Prefer small, concrete troubleshooting entries over long prose.
