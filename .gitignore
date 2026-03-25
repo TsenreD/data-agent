@@ -21,6 +21,7 @@ htmlcov/
 
 .DS_Store
 
+data/
 data/*
 !data/raw/.gitkeep
 

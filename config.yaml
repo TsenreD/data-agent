@@ -41,9 +41,9 @@ agents:
   annotation:
     base_url: http://localhost:8000/v1/chat/completions
     prompt: |
-      Determine whether given problem contains enough information to be solvable.
-      If a problem is not missing crucial information, asnwer \boxed{1}
-      Otherwise answer \boxed{0}
+      Determine whether given problem is a mathematical problem.
+      If a problem is a mathematics problem, answer \boxed{1}
+      Otherwise (closer to a different subject or not a problem at all) answer \boxed{0}
     process_config:
       parallel_workers: 150
       timeout_per_row: 600
@@ -51,8 +51,8 @@ agents:
       max_tokens: 8192
   active_learning:
     task_prompt: |
-      Train classification model to determine whether text contains a full problem, or an incomplete one.
-      When annotation label is 1, problem is considered complete, with label 0 marking incomplete problems.
+      Train classification model to determine whether text contains a mathematical problem.
+      When annotation label is 1, problem is considered mathematical, with label 0 marking non-math problems.
       Use DeepPavlov/rubert-base-cased, train ONLY a classification head on top.
       Make sure to choose model size accordingly to the amount of available data.
       Train for 5 epochs, bs=20.
@@ -67,9 +67,9 @@ agents:
 
 sources:
   - type: hf_dataset
-    name: madrylab/gsm8k-platinum
+    name: tinyBenchmarks/tinyMMLU
     split: test
-    limit: 50
+    limit: 55
     column_map:
       text: question
       label: answer
@@ -77,17 +77,17 @@ sources:
   - type: scrape 
     name: project-euler
     url: https://projecteuler.net/archives
-    limit: 10
+    limit: 15
     allow_network: true
 
   - type: scrape 
     name: all-russian
     url: https://vos.olimpiada.ru/2025/invite/tasks
-    limit: 60
+    limit: 50
     allow_network: true
     extraction_instructions: |
       Extract one record per actual olympiad problem, not one record per year page.
       Follow child links when needed.
       Put the full problem statement in `text`.
       Preserve year, round, source_url, and solution_url when available.
-      Retain only mathematical and physical problems.
+      Retain only mathematical and physics problems.

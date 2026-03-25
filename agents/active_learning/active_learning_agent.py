@@ -504,7 +504,6 @@ class ActiveLearningAgent(BaseAgent):
             import httpx
             from smolagents import CodeAgent, OpenAIModel
             from smolagents.agents import RunResult
-            from agents.tools import build_search_tools
         except Exception as error:
             raise RuntimeError(
                 "Agentic local training requires smolagents with OpenAI-compatible model support."
@@ -537,15 +536,16 @@ class ActiveLearningAgent(BaseAgent):
             config_path=str(config_path.resolve()),
             task_prompt=task_prompt,
         )
-        tools = build_search_tools()
         instructions = (
             "You are a model-training coding agent. "
             "Write robust Python code, run it, inspect runtime outputs, and refine until training succeeds. "
+            "Output executable Python code only, wrapped in <code>...</code> blocks when the executor requires it. "
+            "Do not emit <think> tags, tool-call tags, or XML-like wrappers. "
             "You must produce the requested files and end with strict JSON in final_answer."
         )
         max_steps = max(1, int(self.agent_max_steps))
         with CodeAgent(
-            tools=tools,
+            tools=[],
             model=model,
             executor_type="local",
             executor_kwargs={
