@@ -1,0 +1,80 @@
+import json
+
+import pandas as pd
+
+from agents.data_collection.data_collection_agent import DataCollectionAgent, SourceCollectionResult
+from agents.data_collection.smolagents_backend import NotebookGenerationResult
+
+
+def test_execute_writes_generated_notebook(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "data"
+    notebook_path = tmp_path / "notebooks" / "eda.ipynb"
+    config = {"sources": [{"type": "hf_dataset", "name": "demo"}], "llm": {}}
+
+    agent = DataCollectionAgent(config=config, output_dir=output_dir, notebook_path=notebook_path)
+
+    source_frame = pd.DataFrame({"text": ["hello"], "label": ["pos"]})
+
+    def fake_collect(source):
+        return SourceCollectionResult(dataframe=source_frame)
+
+    def fake_generate(*, frame, dataset_path, notebook_path):
+        return NotebookGenerationResult(
+            notebook={
+                "nbformat": 4,
+                "nbformat_minor": 5,
+                "metadata": {},
+                "cells": [
+                    {"cell_type": "markdown", "metadata": {}, "source": ["# EDA\n"]},
+                    {
+                        "cell_type": "code",
+                        "metadata": {},
+                        "execution_count": None,
+                        "outputs": [],
+                        "source": ["import pandas as pd\n", "df = pd.DataFrame()\n"],
+                    },
+                ],
+            },
+            success=True,
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(agent, "_collect_source", fake_collect)
+    monkeypatch.setattr(agent.notebook_backend, "generate_notebook", fake_generate)
+
+    result = agent.execute()
+
+    assert result.dataframe_path == output_dir / "collection" / "unified_dataset.jsonl"
+    assert result.artifacts["eda_notebook"] == str(notebook_path)
+    assert result.metadata["eda_notebook_notes"] == ["ok"]
+    assert notebook_path.exists()
+
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    assert notebook["nbformat"] == 4
+
+
+def test_default_notebook_path_uses_output_dir(tmp_path) -> None:
+    output_dir = tmp_path / "data"
+    config = {"sources": [], "llm": {}}
+
+    agent = DataCollectionAgent(config=config, output_dir=output_dir)
+
+    assert agent.notebook_path == output_dir / "collection" / "eda.ipynb"
+
+
+def test_agent_config_is_passed_to_backends() -> None:
+    config = {
+        "sources": [],
+        "llm": {},
+        "agents": {
+            "collection": {"max_steps": 9, "max_attempts": 3},
+            "eda": {"max_steps": 5, "max_attempts": 2, "inspection_max_attempts": 1},
+        },
+    }
+
+    agent = DataCollectionAgent(config=config)
+
+    assert agent.collection_backend.agent_config["max_steps"] == 9
+    assert agent.collection_backend.agent_config["max_attempts"] == 3
+    assert agent.notebook_backend.agent_config["max_steps"] == 5
+    assert agent.notebook_backend.agent_config["max_attempts"] == 2

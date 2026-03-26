@@ -1,27 +1,20 @@
 import json
-import ast
-import re
-from string import Template
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-import sys
 
 import pandas as pd
 import requests
 import yaml
 
-from executor.sandbox import SandboxExecutor
-from models.base import BaseModelAdapter
-from models.ollama_adapter import OllamaAdapter
-
 from ..base import AgentResult, BaseAgent
+from .smolagents_backend import SmolagentsCollectionBackend, SmolagentsNotebookBackend
 
 
 UNIFIED_COLUMNS = ["text", "audio", "image", "label", "source", "collected_at", "metadata"]
 SUPPORTED_SOURCE_TYPES = {"hf_dataset", "api", "scrape", "kaggle_dataset"}
-SKILLS_TEMPLATE_PATH = Path(__file__).with_name("SKILLS.md")
 
 
 @dataclass(slots=True)
@@ -36,33 +29,25 @@ class DataCollectionAgent(BaseAgent):
     def __init__(
         self,
         config: str | Path | Mapping[str, Any],
-        model: BaseModelAdapter | None = None,
-        sandbox: SandboxExecutor | None = None,
-        output_dir: str | Path = "data/raw",
-        log_dir: str | Path = "logs",
+        output_dir: str | Path = "data",
+        notebook_path: str | Path | None = None,
     ) -> None:
         self.config = self._load_config(config)
-        self.model = model or self._build_default_model()
-        self.sandbox = sandbox or SandboxExecutor()
-        self.output_dir = Path(output_dir)
+        self.base_output_dir = Path(output_dir)
+        self.output_dir = self._stage_output_dir(self.base_output_dir, "collection")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self._sandbox_session_active = False
-        self._active_log_path: Path | None = None
-        self._active_logs: list[str] | None = None
-
-    def __enter__(self) -> "DataCollectionAgent":
-        self.sandbox.start()
-        self._sandbox_session_active = True
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self.close()
-
-    def close(self) -> None:
-        self.sandbox.close()
-        self._sandbox_session_active = False
+        self.notebook_path = Path(notebook_path) if notebook_path is not None else self.output_dir / "eda.ipynb"
+        agents_config = self.config.get("agents", {})
+        collection_agent_config = agents_config.get("collection", {}) if isinstance(agents_config, Mapping) else {}
+        eda_agent_config = agents_config.get("eda", {}) if isinstance(agents_config, Mapping) else {}
+        self.collection_backend = SmolagentsCollectionBackend(
+            llm_config=self.config.get("llm", {}),
+            agent_config=collection_agent_config,
+        )
+        self.notebook_backend = SmolagentsNotebookBackend(
+            llm_config=self.config.get("llm", {}),
+            agent_config=eda_agent_config,
+        )
 
     def run(self, sources: Sequence[Mapping[str, Any]] | None = None) -> pd.DataFrame:
         payload = {"sources": list(sources)} if sources is not None else None
@@ -71,15 +56,14 @@ class DataCollectionAgent(BaseAgent):
             raise RuntimeError("DataCollectionAgent did not produce a dataframe.")
         return result.dataframe
 
+    def _stage_output_dir(self, output_dir: Path, stage_name: str) -> Path:
+        if output_dir.name == stage_name:
+            return output_dir
+        return output_dir / stage_name
+
     def execute(self, payload: Mapping[str, Any] | None = None) -> AgentResult:
-        sandbox_owned_here = False
         logs: list[str] = []
-        log_path = self._start_log_session(logs)
         self._record_log("Starting DataCollectionAgent execution.", logs)
-        if not self._sandbox_session_active:
-            self.sandbox.start()
-            sandbox_owned_here = True
-            self._record_log("Sandbox session started for this execution.", logs)
 
         try:
             sources = self._resolve_sources(payload)
@@ -99,18 +83,21 @@ class DataCollectionAgent(BaseAgent):
                 if source_result.attempts:
                     source_attempts[source_key] = source_result.attempts
                 if not source_result.success:
+                    failure_reason = self._summarize_source_failure(source_result)
                     failed_sources.append(
                         {
                             "source": source_key,
                             "type": source_type,
-                            "reason": source_result.logs[-1] if source_result.logs else "Collection failed.",
+                            "reason": failure_reason,
                         }
                     )
-                    self._record_log(f"Source {source_key} failed; continuing with remaining sources.", logs)
+                    self._record_log(
+                        f"Source {source_key} failed ({failure_reason}); continuing with remaining sources.",
+                        logs,
+                    )
                     continue
 
-                frame = source_result.dataframe
-                normalized = self._normalize_frame(frame, source)
+                normalized = self._normalize_frame(source_result.dataframe, source)
                 collected_frames.append(normalized)
                 self._record_log(f"Collected {len(normalized)} rows from {source_key}.", logs)
 
@@ -119,13 +106,28 @@ class DataCollectionAgent(BaseAgent):
             merged.to_json(dataset_path, orient="records", lines=True, force_ascii=False)
             self._record_log(f"Wrote merged dataset to {dataset_path}.", logs)
 
-            from analysis.eda import generate_eda_report
-
-            metrics, artifacts = generate_eda_report(merged, self.output_dir / "eda")
+            notebook_result = self.notebook_backend.generate_notebook(
+                frame=merged,
+                dataset_path=dataset_path,
+                notebook_path=self.notebook_path,
+            )
+            self._record_existing_logs(notebook_result.logs, logs)
+            if not notebook_result.success or notebook_result.notebook is None:
+                notebook_error = self._summarize_notebook_failure(notebook_result)
+                raise RuntimeError(f"EDA notebook generation failed: {notebook_error}")
+            self.notebook_path.parent.mkdir(parents=True, exist_ok=True)
+            self.notebook_path.write_text(
+                json.dumps(notebook_result.notebook, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             schema = {column: str(dtype) for column, dtype in merged.dtypes.items()}
-            metrics["failed_sources"] = len(failed_sources)
+            metrics = {
+                "row_count": int(len(merged)),
+                "failed_sources": len(failed_sources),
+            }
+            artifacts = {"eda_notebook": str(self.notebook_path)}
             self._record_log(
-                f"Generated EDA artifacts: {', '.join(sorted(artifacts)) if artifacts else 'none'}.",
+                f"Generated EDA notebook at {self.notebook_path}.",
                 logs,
             )
             self._record_log("DataCollectionAgent execution finished successfully.", logs)
@@ -141,7 +143,7 @@ class DataCollectionAgent(BaseAgent):
                     "sources": sources,
                     "failed_sources": failed_sources,
                     "source_attempts": source_attempts,
-                    "log_path": str(log_path),
+                    "eda_notebook_notes": notebook_result.notes,
                 },
             )
         except Exception as error:
@@ -150,11 +152,6 @@ class DataCollectionAgent(BaseAgent):
                 logs,
             )
             raise
-        finally:
-            if sandbox_owned_here:
-                self.sandbox.close()
-                self._record_log("Closed sandbox session owned by this execution.", logs)
-            self._end_log_session()
 
     def merge(self, sources: Sequence[pd.DataFrame]) -> pd.DataFrame:
         if not sources:
@@ -172,11 +169,13 @@ class DataCollectionAgent(BaseAgent):
         if source_type == "hf_dataset":
             return SourceCollectionResult(dataframe=self.load_dataset(source["name"], source="hf", options=source))
         if source_type == "kaggle_dataset":
-            return SourceCollectionResult(dataframe=self.load_dataset(source["name"], source="kaggle", options=source))
+            return SourceCollectionResult(
+                dataframe=self.load_dataset(source["name"], source="kaggle", options=source)
+            )
         if source_type == "scrape":
             return self.scrape(source["url"], source.get("selector"), source)
-        if source.get("agentic"):
-            return self._run_agentic_source(source, skill=source_type)
+        if source_type == "api" and source.get("agentic"):
+            return self._run_agentic_source(source)
         if source_type == "api":
             return SourceCollectionResult(
                 dataframe=self.fetch_api(source["endpoint"], source.get("params"), source)
@@ -193,7 +192,7 @@ class DataCollectionAgent(BaseAgent):
         source_config["url"] = url
         if selector:
             source_config["selector"] = selector
-        return self._run_agentic_source(source_config, skill="scrape")
+        return self._run_agentic_source(source_config)
 
     def fetch_api(
         self,
@@ -239,7 +238,7 @@ class DataCollectionAgent(BaseAgent):
             file_path = options.get("file_path")
             if not file_path:
                 raise NotImplementedError(
-                    "Kaggle support in v1 expects a local CSV or JSON file via 'file_path'."
+                    "Kaggle support expects a local CSV or JSON file via 'file_path'."
                 )
             path = Path(file_path)
             if path.suffix.lower() == ".csv":
@@ -250,204 +249,34 @@ class DataCollectionAgent(BaseAgent):
 
         raise ValueError(f"Unsupported dataset source '{source}'.")
 
-    def _run_agentic_source(self, source: Mapping[str, Any], skill: str) -> SourceCollectionResult:
-        if self.model is None:
-            raise ValueError(f"{skill} sources require a model adapter.")
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "python_code": {"type": "string"},
-            },
-            "required": ["python_code"],
-        }
-        messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": self._build_agentic_system_prompt(skill),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Generate extraction code for the '{skill}' skill using this source configuration:\n"
-                    f"{json.dumps(source, indent=2)}"
-                ),
-            },
-        ]
-        attempts: list[dict[str, Any]] = []
-        logs: list[str] = []
-        max_attempts = max(1, int(source.get("max_attempts", 3 if skill == "scrape" else 2)))
-        retry_on_empty = bool(source.get("retry_on_empty", skill == "scrape"))
-
-        for attempt_number in range(1, max_attempts + 1):
-            self._record_log(
-                f"Starting {skill} attempt {attempt_number} for {self._source_key(source)}.",
-                logs,
-            )
-            try:
-                response = self.model.chat(messages, json_schema=schema)
-                raw_code = response["python_code"] if isinstance(response, dict) else str(response)
-                code = self._prepare_generated_code(raw_code)
-                self._record_log(
-                    self._format_generated_code_log(skill, source, attempt_number, code),
-                    logs,
-                    already_formatted=True,
-                )
-            except Exception as error:
-                attempt_record = {
-                    "attempt": attempt_number,
-                    "success": False,
-                    "stdout": "",
-                    "stderr": "",
-                    "error_message": f"Model generation failed: {error}",
-                    "exception_type": type(error).__name__,
-                    "returncode": None,
-                    "generated_code": "",
-                    "row_count": 0,
-                }
-                attempts.append(attempt_record)
-                for line in self._format_attempt_logs(skill, source, attempt_record):
-                    self._record_log(line, logs, already_formatted=True)
-                if attempt_number == max_attempts:
-                    break
-                continue
-
-            execution = self.sandbox.execute(code, {"source": dict(source)})
-
-            attempt_record = {
-                "attempt": attempt_number,
-                "success": execution.success,
-                "stdout": execution.stdout,
-                "stderr": execution.stderr,
-                "error_message": execution.error_message,
-                "exception_type": execution.exception_type,
-                "returncode": execution.returncode,
-                "generated_code": execution.generated_code,
-                "row_count": int(len(execution.dataframe)),
-            }
-            attempts.append(attempt_record)
-            for line in self._format_attempt_logs(skill, source, attempt_record):
-                self._record_log(line, logs, already_formatted=True)
-
-            if execution.success and (len(execution.dataframe) > 0 or not retry_on_empty):
-                return SourceCollectionResult(
-                    dataframe=execution.dataframe,
-                    success=True,
-                    logs=logs,
-                    attempts=attempts,
-                )
-
-            if attempt_number == max_attempts:
-                break
-
-            retry_reason = execution.error_message or "Sandbox returned an empty dataframe."
-            messages.extend(
-                [
-                    {"role": "assistant", "content": code},
-                    {
-                        "role": "user",
-                        "content": self._build_retry_prompt(source, attempt_record, retry_reason),
-                    },
-                ]
-            )
-
+    def _run_agentic_source(self, source: Mapping[str, Any]) -> SourceCollectionResult:
+        result = self.collection_backend.collect(source)
+        frame = pd.DataFrame(result.records)
         return SourceCollectionResult(
-            dataframe=pd.DataFrame(),
-            success=False,
-            logs=logs,
-            attempts=attempts,
+            dataframe=frame,
+            success=result.success,
+            logs=result.logs,
+            attempts=result.attempts,
         )
 
-    def _build_agentic_system_prompt(self, skill: str) -> str:
-        base = self._render_skills_prompt()
-        if skill == "scrape":
-            return (
-                f"{base} "
-                "Return plain Python source only, with no Markdown fences. "
-                "The code must define run(context) as the only required entrypoint and run(context) must return a pandas.DataFrame. "
-                "For scraping: fetch the page from context['source']['url'], parse it with BeautifulSoup, "
-                "if context['source'] contains 'selector' then use it, otherwise infer a stable repeated record boundary "
-                "from the page structure before extracting rows. Honor optional 'attribute' and 'limit', and return a "
-                "DataFrame with the extracted fields. Prefer a 'text' column when only one value is available."
-            )
-        if skill == "api":
-            return (
-                f"{base} "
-                "For APIs: call context['source']['endpoint'] with optional params and headers, convert the JSON payload "
-                "into a list of records, and return a DataFrame."
-            )
-        return base
-
-    def _render_skills_prompt(self) -> str:
-        requirements = "\n".join(
-            f"- `{module}`" for module in sorted(self.sandbox.allowed_imports)
-        )
-        template = Template(SKILLS_TEMPLATE_PATH.read_text(encoding="utf-8"))
-        return template.substitute(requirements=requirements)
-
-    def _build_retry_prompt(
-        self,
-        source: Mapping[str, Any],
-        attempt_record: Mapping[str, Any],
-        retry_reason: str,
-    ) -> str:
-        return (
-            "The previous generated code did not produce an acceptable result. "
-            "Revise the code and return only JSON with a new 'python_code' value.\n"
-            "The revised code must define run(context) and run(context) must return a pandas.DataFrame.\n"
-            f"Source configuration:\n{json.dumps(dict(source), indent=2)}\n"
-            f"Failure reason: {retry_reason}\n"
-            f"stdout:\n{attempt_record.get('stdout') or '<empty>'}\n"
-            f"stderr:\n{attempt_record.get('stderr') or '<empty>'}\n"
-            f"Previous row count: {attempt_record.get('row_count')}"
-        )
-
-    def _format_attempt_logs(
-        self,
-        skill: str,
-        source: Mapping[str, Any],
-        attempt_record: Mapping[str, Any],
-    ) -> list[str]:
-        source_key = self._source_key(source)
-        status = "succeeded" if attempt_record["success"] else "failed"
-        lines = [
-            f"{skill} attempt {attempt_record['attempt']} for {source_key} {status} with {attempt_record['row_count']} rows.",
-        ]
-        if attempt_record.get("error_message"):
-            lines.append(
-                f"{skill} attempt {attempt_record['attempt']} error for {source_key}: "
-                f"{attempt_record['error_message']}"
-            )
-        if attempt_record.get("stderr"):
-            lines.append(
-                f"{skill} attempt {attempt_record['attempt']} stderr for {source_key}: "
-                f"{attempt_record['stderr'].strip()}"
-            )
-        if attempt_record.get("stdout"):
-            lines.append(
-                f"{skill} attempt {attempt_record['attempt']} stdout for {source_key}: "
-                f"{attempt_record['stdout'].strip()}"
-            )
-        return lines
-
-    def _start_log_session(self, logs: list[str]) -> Path:
-        started_at = datetime.now(UTC)
-        agent_log_dir = self.log_dir / self._agent_log_dir_name()
-        agent_log_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{started_at.strftime('%Y-%m-%d_%H-%M-%S')}.log"
-        log_path = agent_log_dir / filename
-        collision_index = 1
-        while log_path.exists():
-            collision_index += 1
-            log_path = agent_log_dir / f"{started_at.strftime('%Y-%m-%d_%H-%M-%S')}-{collision_index}.log"
-        self._active_logs = logs
-        self._active_log_path = log_path
-        log_path.write_text("", encoding="utf-8")
-        return log_path
-
-    def _end_log_session(self) -> None:
-        self._active_logs = None
-        self._active_log_path = None
+    @staticmethod
+    def _summarize_source_failure(result: SourceCollectionResult) -> str:
+        if result.attempts:
+            last = dict(result.attempts[-1])
+            error_message = str(last.get("error_message") or "").strip()
+            if error_message:
+                return error_message
+            notes = last.get("notes") or []
+            if notes:
+                note = str(notes[-1]).strip()
+                if note:
+                    return note
+            state = str(last.get("state") or "").strip()
+            if state:
+                return f"attempt state: {state}"
+        if result.logs:
+            return str(result.logs[-1])
+        return "Collection failed."
 
     def _record_existing_logs(self, entries: Sequence[str], logs: list[str]) -> None:
         for entry in entries:
@@ -462,91 +291,10 @@ class DataCollectionAgent(BaseAgent):
         already_formatted: bool = False,
     ) -> str:
         entry = message if already_formatted else f"[{datetime.now(UTC).isoformat()}] {message}"
-        target_logs = logs if logs is not None else self._active_logs
-        if target_logs is not None:
-            target_logs.append(entry)
-        if self._active_log_path is not None:
-            with self._active_log_path.open("a", encoding="utf-8") as handle:
-                handle.write(f"{entry}\n")
+        if logs is not None:
+            logs.append(entry)
         print(entry, file=sys.stdout, flush=True)
         return entry
-
-    def _format_generated_code_log(
-        self,
-        skill: str,
-        source: Mapping[str, Any],
-        attempt_number: int,
-        code: str,
-    ) -> str:
-        source_key = self._source_key(source)
-        return (
-            f"{skill} attempt {attempt_number} generated code for {source_key}:\n"
-            f"{code.strip()}"
-        )
-
-    def _agent_log_dir_name(self) -> str:
-        name = self.__class__.__name__
-        snake_case = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
-        return snake_case
-
-    def _prepare_generated_code(self, code: str) -> str:
-        stripped = code.strip()
-        if not stripped:
-            return stripped
-
-        try:
-            tree = ast.parse(stripped)
-        except SyntaxError:
-            return stripped
-
-        function_names = [
-            node.name
-            for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
-        if "run" in function_names:
-            return stripped
-
-        helper_names = [
-            name
-            for name in function_names
-            if not name.startswith("_")
-        ]
-        if not helper_names:
-            return stripped
-
-        wrapper = self._build_run_wrapper(helper_names)
-        return f"{stripped}\n\n{wrapper}"
-
-    def _build_run_wrapper(self, helper_names: Sequence[str]) -> str:
-        helper_list = ", ".join(repr(name) for name in helper_names)
-        return (
-            "def run(context):\n"
-            f"    helper_names = [{helper_list}]\n"
-            "    last_error = None\n"
-            "    for helper_name in helper_names:\n"
-            "        helper = globals().get(helper_name)\n"
-            "        if not callable(helper):\n"
-            "            continue\n"
-            "        for args in ((context,), (context.get('source', {}),), tuple()):\n"
-            "            try:\n"
-            "                result = helper(*args)\n"
-            "            except TypeError as error:\n"
-            "                last_error = error\n"
-            "                continue\n"
-            "            if isinstance(result, pd.DataFrame):\n"
-            "                return result\n"
-            "            if isinstance(result, list):\n"
-            "                return pd.DataFrame(result)\n"
-            "            if isinstance(result, dict):\n"
-            "                return pd.DataFrame([result])\n"
-            "            if result is None:\n"
-            "                continue\n"
-            "            raise TypeError(f'Helper {helper_name} returned unsupported type {type(result).__name__}.')\n"
-            "    if last_error is not None:\n"
-            "        raise RuntimeError(f'Unable to adapt generated helper into run(context): {last_error}')\n"
-            "    raise RuntimeError('Generated code did not expose a callable helper that could be wrapped as run(context).')\n"
-        )
 
     def _normalize_frame(self, frame: pd.DataFrame, source: Mapping[str, Any]) -> pd.DataFrame:
         working = frame.copy()
@@ -566,7 +314,10 @@ class DataCollectionAgent(BaseAgent):
                     working[unified_name] = None
 
         metadata_columns = [column for column in working.columns if column not in {"text", "audio", "image", "label"}]
-        working["metadata"] = working[metadata_columns].to_dict(orient="records")
+        if metadata_columns:
+            working["metadata"] = working[metadata_columns].to_dict(orient="records")
+        else:
+            working["metadata"] = [{} for _ in range(len(working))]
         working["source"] = source.get("name") or source.get("url") or source.get("endpoint") or source["type"]
         working["collected_at"] = datetime.now(UTC).isoformat()
         return working[UNIFIED_COLUMNS]
@@ -606,20 +357,19 @@ class DataCollectionAgent(BaseAgent):
         with path.open("r", encoding="utf-8") as handle:
             return yaml.safe_load(handle) or {}
 
-    def _build_default_model(self) -> BaseModelAdapter | None:
-        llm_config = dict(self.config.get("llm", {}))
-        if llm_config and llm_config.get("provider", "ollama") != "ollama":
-            return None
-        if not llm_config and not self._requires_agentic_model():
-            return None
-
-        return OllamaAdapter(
-            model=llm_config.get("model", "kimi-k2.5:cloud"),
-            base_url=llm_config.get("base_url", "http://localhost:11434"),
-        )
-
-    def _requires_agentic_model(self) -> bool:
-        for source in self.config.get("sources", []):
-            if source.get("type") == "scrape" or source.get("agentic"):
-                return True
-        return False
+    def _summarize_notebook_failure(self, result: Any) -> str:
+        attempts = getattr(result, "attempts", []) or []
+        if attempts:
+            last_attempt = attempts[-1]
+            if last_attempt.get("error_message"):
+                return str(last_attempt["error_message"])
+            notes = last_attempt.get("notes") or []
+            if notes:
+                return " | ".join(str(note) for note in notes)
+        notes = getattr(result, "notes", []) or []
+        if notes:
+            return " | ".join(str(note) for note in notes)
+        logs = getattr(result, "logs", []) or []
+        if logs:
+            return str(logs[-1])
+        return "unknown notebook generation error"

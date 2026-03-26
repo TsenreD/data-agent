@@ -1,62 +1,53 @@
-# Data Collection Agent
+# data-agent
 
-This repository contains a v1 `DataCollectionAgent` that collects data from multiple sources, normalizes it into a fixed schema, persists the merged dataset, and produces basic EDA artifacts. The intended downstream ML task for the sample configuration is text classification or sentiment-style labeling over heterogeneous text sources.
+Local multi-stage data pipeline with agent components for collection, annotation, active learning, and quality checks.
 
-## Architecture
+## What this repo does
 
-The project uses a sequential pipeline shape:
+The project defines agent stages that can be run sequentially through a CLI pipeline:
 
-- `PipelineRunner` orchestrates agents one at a time.
-- `DataCollectionAgent` handles source planning, collection, normalization, merge, persistence, and EDA.
-- `SandboxExecutor` runs model-generated extraction code inside Docker rather than on the host interpreter.
-- `OllamaAdapter` provides a thin wrapper around a local Ollama server.
+- `DataCollectionAgent`: collect + normalize rows from configured sources.
+- `DataAnnotationAgent`: produce annotation artifacts, confidence/review flags, and Label Studio export payloads.
+- `ActiveLearningAgent`: orchestrate deterministic split + CodeAgent-driven training + epoch loss reporting.
+- `DataQualityAgent`: detect/fix data quality issues and persist cleaned outputs.
 
-For v1, the top-level pipeline is plain Python rather than a graph framework. The agentic boundary stays inside the collection agent.
+Pipeline handoff is done through `AgentResult` payloads and artifact paths.
 
-## Unified schema
+## Local launch flow
 
-Collected rows are normalized to these columns:
+### 1) Clone
 
-- `text`
-- `audio`
-- `image`
-- `label`
-- `source`
-- `collected_at`
-- `metadata`
+```bash
+git clone <YOUR_REPO_URL>
+cd data-agent
+```
 
-`metadata` stores source-specific fields that are not part of the core schema.
-
-## Install
-
-Create a Python 3.11 virtual environment and install the package:
+### 2) Create environment and install
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install .
+python -m pip install -e .
 ```
 
-For local development:
+### 3) Configure
 
-```bash
-python -m pip install -e ".[dev]"
-```
+Edit `config.yaml`:
 
-Build the execution image used for agentic sources:
+- `llm.base_url`, `llm.model`, `llm.api_key`
+- `agents.*` settings
+- `sources` list
 
-```bash
-docker build -t data-agent-execution-backend:latest -f agents/data_collection/Dockerfile.sandbox agents/data_collection
-```
+Important:
+- Do not commit real API tokens. Use env vars or local-only config values.
+- If you already committed a token, rotate it.
 
-## Run
-
-Run the installed CLI:
+### 4) Launch from CLI
 
 ```bash
 source .venv/bin/activate
-MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml
+MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml --output-dir data
 ```
 
 Optional preview:
@@ -65,61 +56,133 @@ Optional preview:
 MPLCONFIGDIR=/tmp/mpl data-agent --config config.yaml --print-head 5
 ```
 
-Run the collection agent from Python:
+CLI args:
 
-```python
-from agents import DataCollectionAgent
+- `--config`: config file path (default `config.yaml`)
+- `--output-dir`: artifact root (default `data`)
+- `--print-head N`: print first `N` rows after run
 
-agent = DataCollectionAgent(config="config.yaml")
-df = agent.run()
-print(df.head())
+## Current runner behavior
+
+`cli.py` controls which stages are active in `build_runner()`.
+
+At the moment, only the `active_learning` stage is enabled in the default CLI path, and collection/quality/annotation lines are commented out.
+
+If you want full sequential flow, enable those blocks in `build_runner()`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    CFG[config.yaml] --> CLI[data-agent CLI]
+    CLI --> PR[PipelineRunner]
+
+    PR --> C[DataCollectionAgent]
+    C --> A[DataAnnotationAgent]
+    A --> AL[ActiveLearningAgent]
+    AL --> Q[DataQualityAgent]
+
+    C --> OC[data/collection/*]
+    A --> OA[data/annotation/*]
+    AL --> OAL[data/active_learning/*]
+    Q --> OQ[data/quality/*]
+
+    C -. AgentResult .-> A
+    A -. AgentResult .-> AL
+    AL -. AgentResult .-> Q
 ```
 
-Runtime prerequisites outside Python packaging:
+### Core abstractions
 
-- an OpenAI-compatible model endpoint must already be available at the `llm.base_url` configured in `config.yaml`
-- Docker must be available for sandboxed execution of generated scraping code
-- per-agent runtime logs are written under `logs/` by default
+- `BaseAgent`: each stage implements `execute(payload) -> AgentResult`
+- `AgentResult`: dataframe + schema + metrics + artifacts + logs + metadata
+- `PipelineRunner`: runs a list of agents sequentially, passing prior result as next payload
 
-Run inside a sequential pipeline:
+### Data flow (conceptual)
 
-```python
-from agents import DataCollectionAgent, PipelineRunner
+1. Collection stage writes unified dataset
+2. Annotation stage writes labeled/review artifacts
+3. Active learning stage consumes labeled rows, creates train/val/pool, runs training orchestration
+4. Quality stage validates/fixes and writes cleaned outputs
 
-runner = PipelineRunner([DataCollectionAgent("config.yaml")])
-result = runner.run()
-print(result.dataframe_path)
+### Active learning design (current)
+
+- Deterministic split (`random_seed`, stratified by target column)
+- Script/code generation and execution delegated to CodeAgent
+- Metrics must include per-epoch `loss_history`
+- Report plots `train_loss` and `val_loss` against `epoch`
+
+## Repository layout
+
+```text
+agents/
+  base.py
+  pipeline.py
+  data_collection/
+  data_annotation/
+  active_learning/
+  data_quality/
+models/
+cli.py
+config.yaml
+tests/
 ```
-
-## Source configuration
-
-Supported source types in v1:
-
-- `hf_dataset`
-- `api`
-- `scrape` via on-the-fly LLM code generation plus sandbox execution
-- `kaggle_dataset` using a local exported file via `file_path`
-
-Scraping is always agentic in v1: the model generates Python extraction code at runtime, and the sandbox executes it to produce the `DataFrame`. `api` sources can still use the deterministic connector by default, or opt into the same model-generated path with `agentic: true`.
-
-For agentic sources, the sandbox never raises exceptions back into the agent. It returns structured execution results with `stdout`, `stderr`, exit status, and error details so the agent can retry with revised code. Use `max_attempts` and `retry_on_empty` in a source config to control that loop.
-Attempt history is returned in `AgentResult.metadata["source_attempts"]`.
-
-The executor expects a Docker image with Python plus the allowed libraries. By default it uses `data-agent-execution-backend:latest`; override this with `DATA_AGENT_SANDBOX_IMAGE` if needed. The executor starts one or more long-lived sandbox containers for the duration of an agent run and reuses them across retries instead of launching a fresh container for every attempt. Network is disabled by default at the sandbox level and only opened for sources with `allow_network: true` or for `scrape` / `api` sources by default.
 
 ## Outputs
 
-Running the agent writes:
+Under `data/` (or your `--output-dir`):
 
-- merged dataset to `data/raw/unified_dataset.jsonl`
-- EDA plots to `data/raw/eda/`
+- `collection/`
+- `annotation/`
+- `active_learning/`
+- `quality/`
 
-The notebook scaffold lives at `notebooks/eda.ipynb`.
+Typical active-learning artifacts:
 
-## Limitations
+- `train.jsonl`, `val.jsonl`, `pool.jsonl`
+- `training_job_config.json`
+- `training_metrics.json`
+- model artifact (`model_path` from config)
+- `active_learning_curve.png`
 
-- The sandbox is container-based and materially safer than host subprocess execution, but it is still not equivalent to a VM or microVM boundary.
-- Kaggle support is intentionally narrow in v1 and expects a local export path.
-- Audio and image EDA are left as the next increment; text EDA is implemented now.
-- Any run that includes a `scrape` source requires a configured model adapter such as `OllamaAdapter`.
-- Docker and a compatible execution image are required for agentic sources.
+## Development workflow
+
+Install dev deps:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+Run a file-level syntax check quickly:
+
+```bash
+python -m py_compile agents/active_learning/active_learning_agent.py
+```
+
+## Troubleshooting
+
+### `target_column` is wrong in training config
+
+If `training_job_config.json` shows an unexpected target, check `agents.active_learning.target_column` in `config.yaml`.
+
+### CodeAgent import errors (authorized modules)
+
+The executor only allows modules listed in `additional_authorized_imports` in active-learning code.
+
+### Missing dependencies inside runtime
+
+Install project dependencies in the same environment used to launch CLI.
+
+## README best-practice notes for this repo
+
+- Keep quickstart command-first and copy-paste safe.
+- Document defaults and current behavior (especially staged pipeline toggles).
+- Call out secrets handling explicitly.
+- Keep artifact paths and config keys versioned with code changes.
+- Prefer small, concrete troubleshooting entries over long prose.

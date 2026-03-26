@@ -1,25 +1,93 @@
 project:
-  name: text-sentiment-collection
+  name: math-dataset-collection
   modality: text
 
+# llm:
+#   provider: ollama
+#   model: gpt-oss:120b-cloud
+#   base_url: http://localhost:11434/v1/chat/completions
+#   github_token: 
+
+# llm:
+#   provider: openrouter
+#   model: nvidia/nemotron-3-super-120b-a12b:free
+#   base_url: https://openrouter.ai/api/v1/chat/completions
+#   api_key: 
+#   github_token: 
+
 llm:
-  provider: ollama
-  model: kimi-k2.5:cloud
-  base_url: http://localhost:11434/v1/chat/completions
+  provider: local
+  model: /home/jovyan/shares/SR008.fs2/models/MiniMax-M2.5/
+  base_url: http://localhost:8000/v1/chat/completions
+  api_key: empty
+  github_token: 
+
+agents:
+  collection:
+    max_steps: 30
+    max_attempts: 1
+    retry_on_empty: true
+    execution_timeout_seconds: 50
+  eda:
+    max_steps: 6
+    max_attempts: 4
+    inspection_max_attempts: 2
+  quality:
+    imbalance_threshold: 0.8
+    strategy:
+      missing: median
+      duplicates: drop
+      outliers: clip_iqr
+  annotation:
+    base_url: http://localhost:8000/v1/chat/completions
+    prompt: |
+      Determine whether given problem is a mathematical problem.
+      If a problem is a mathematics problem, answer \boxed{1}
+      Otherwise (closer to a different subject or not a problem at all) answer \boxed{0}
+    process_config:
+      parallel_workers: 150
+      timeout_per_row: 600
+      max_retries: 2
+      max_tokens: 8192
+  active_learning:
+    task_prompt: |
+      Train classification model to determine whether text contains a mathematical problem.
+      When annotation label is 1, problem is considered mathematical, with label 0 marking non-math problems.
+      Use DeepPavlov/rubert-base-cased, train ONLY a classification head on top.
+      Make sure to choose model size accordingly to the amount of available data.
+      Train for 5 epochs, bs=20.
+    feature_columns:
+      - text
+    strategy: entropy
+    batch_size: 20
+    max_steps: 30
+    test_size: 0.25
+    execution_timeout_seconds: 180
+
 
 sources:
   - type: hf_dataset
-    name: MathArena/aime_2026
-    split: train
-    limit: 200
+    name: tinyBenchmarks/tinyMMLU
+    split: test
+    limit: 55
     column_map:
-      text: problem
+      text: question
       label: answer
 
-  - type: scrape
-    name: aops-all-russian-olympiad
-    url: https://artofproblemsolving.com/community/c4299349_2025_allrussian_olympiad
-    limit: 200
+  - type: scrape 
+    name: project-euler
+    url: https://projecteuler.net/archives
+    limit: 15
     allow_network: true
-    max_attempts: 3
-    retry_on_empty: true
+
+  - type: scrape 
+    name: all-russian
+    url: https://vos.olimpiada.ru/2025/invite/tasks
+    limit: 50
+    allow_network: true
+    extraction_instructions: |
+      Extract one record per actual olympiad problem, not one record per year page.
+      Follow child links when needed.
+      Put the full problem statement in `text`.
+      Preserve year, round, source_url, and solution_url when available.
+      Retain only mathematical and physics problems.

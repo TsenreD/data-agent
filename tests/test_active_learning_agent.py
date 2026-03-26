@@ -1,0 +1,336 @@
+from pathlib import Path
+import pickle
+
+import pandas as pd
+
+from agents import ActiveLearningAgent, DataAnnotationAgent, PipelineRunner
+
+
+class DummyAnnotationPromptAdapter:
+    def chat(self, messages, json_schema=None):
+        payload = __import__("json").loads(messages[-1]["content"])
+        if "sample_rows" in payload:
+            return {"filter_condition": None, "row_indices": [0, 1]}
+        if "sample_filtered_row" in payload:
+            return {
+                "row_prompt": (
+                    "If the problem statement is complete, set has_complete_problem to true and fill label. "
+                    "If it is incomplete, set has_complete_problem to false and leave label empty."
+                )
+            }
+        rows = payload.get("rows")
+        if rows is None:
+            rows = [payload]
+        result_rows = []
+        for row in rows:
+            updated = dict(row)
+            text = str(updated.get("text", ""))
+            if "Incomplete" in text:
+                updated["label"] = None
+                updated["has_complete_problem"] = False
+            else:
+                updated["label"] = "42"
+                updated["has_complete_problem"] = True
+            result_rows.append(updated)
+        if "rows" in payload:
+            return {"rows": result_rows}
+        return result_rows[0]
+
+
+def _write_training_outputs(artifacts, *, backend: str = "torch") -> None:
+    checkpoint = {
+        "architecture": "numpy_softmax",
+        "vectorizer": {"token_to_index": {"complete": 1, "incomplete": 2}, "unknown_index": 0},
+        "index_to_label": ["false", "true"],
+        "weights": [[0.0, 0.0], [1.0, -1.0], [-1.0, 1.0]],
+        "bias": [0.0, 0.0],
+    }
+    with Path(artifacts.model_path).open("wb") as handle:
+        pickle.dump(checkpoint, handle)
+    Path(artifacts.training_metrics_path).write_text(
+        (
+            '{"accuracy": 1.0, "macro_f1": 1.0, '
+            '"evaluated_rows": 2, "train_rows": 2, "val_rows": 2, '
+            f'"backend": "{backend}"}}'
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_active_learning_agent_selects_prompt_aligned_target_and_queries_pool(monkeypatch, tmp_path) -> None:
+    output_dir = tmp_path / "data"
+    frame = pd.DataFrame(
+        {
+            "text": [
+                "Complete problem about algebra with all conditions",
+                "Incomplete fragment missing the question",
+                "Complete geometry problem with a diagram description",
+                "Incomplete problem statement without numbers",
+                "Complete probability problem with enough context",
+                "Incomplete prompt with only answer choices",
+                "Unlabeled draft that looks complete but needs review",
+                "Unlabeled short fragment with missing context",
+            ],
+            "notes": [
+                "math",
+                "math",
+                "math",
+                "math",
+                "math",
+                "math",
+                "draft",
+                "draft",
+            ],
+            "has_complete_problem": [True, False, True, False, True, False, None, None],
+            "label": ["1", None, "2", None, "3", None, None, None],
+        }
+    )
+    agent = ActiveLearningAgent(
+        config={
+            "agents": {
+                "active_learning": {
+                    "task_prompt": "Train classification model to determine whether text contains a full problem, or an incomplete one",
+                    "batch_size": 2,
+                    "target_column": "has_complete_problem",
+                    "model": {"epochs": 18, "dim": 32, "bucket_size": 2048},
+                }
+            }
+        },
+        output_dir=output_dir,
+    )
+    monkeypatch.setattr(agent, "_run_training_locally_with_code_agent", lambda **kwargs: _write_training_outputs(kwargs["artifacts"]))
+
+    result = agent.execute({"dataframe": frame})
+
+    assert result.dataframe is not None
+    assert result.metadata["active_learning"]["target_column"] == "has_complete_problem"
+    assert "text" in result.metadata["active_learning"]["feature_columns"]
+    assert result.metadata["active_learning"]["selected_rows"] == 2
+    assert result.dataframe["active_learning_selected"].sum() == 2
+    assert Path(result.artifacts["active_learning_queries"]).exists()
+    assert Path(result.artifacts["active_learning_summary"]).exists()
+    assert Path(result.artifacts["active_learning_report"]).exists()
+    assert Path(result.artifacts["active_learning_train_script"]).exists()
+    assert Path(result.artifacts["active_learning_train_dataset"]).exists()
+    assert Path(result.artifacts["active_learning_val_dataset"]).exists()
+    assert Path(result.artifacts["active_learning_pool_dataset"]).exists()
+    assert Path(result.artifacts["active_learning_model"]).exists()
+    assert Path(result.artifacts["active_learning_training_metrics"]).exists()
+    assert result.metrics["active_learning_accuracy"] >= 0.0
+
+
+def test_active_learning_run_cycle_and_report(tmp_path) -> None:
+    agent = ActiveLearningAgent(
+        config={
+            "agents": {
+                "active_learning": {
+                    "task_prompt": "Classify whether a text is complete or incomplete",
+                    "batch_size": 2,
+                    "target_column": "has_complete_problem",
+                    "model": {"epochs": 20, "dim": 24, "bucket_size": 1024},
+                }
+            }
+        },
+        output_dir=tmp_path / "data",
+    )
+    labeled = pd.DataFrame(
+        {
+            "text": [
+                "Complete problem with all data",
+                "Incomplete fragment",
+                "Complete statement with conditions",
+                "Incomplete prompt with missing variables",
+                "Complete proof task",
+                "Incomplete sentence without the actual question",
+            ],
+            "has_complete_problem": [True, False, True, False, True, False],
+        }
+    )
+    pool = pd.DataFrame(
+        {
+            "text": [
+                "Complete olympiad problem statement",
+                "Incomplete stub with no task",
+                "Complete combinatorics setup",
+                "Incomplete line copied from a worksheet",
+            ],
+            "has_complete_problem": [True, False, True, False],
+        }
+    )
+
+    history = agent.run_cycle(labeled, pool, strategy="entropy", n_iterations=2, batch_size=2)
+    random_history = agent.run_cycle(labeled, pool, strategy="random", n_iterations=2, batch_size=2)
+    report_path = agent.report(history, random_history=random_history)
+
+    assert len(history) == 2
+    assert history[0]["n_labeled"] == 6
+    assert history[1]["n_labeled"] == 8
+    assert report_path.exists()
+
+
+def test_active_learning_integrates_after_annotation_prompt(monkeypatch, tmp_path) -> None:
+    output_dir = tmp_path / "data"
+    frame = pd.DataFrame(
+        {
+            "text": [
+                "Complete problem with enough detail",
+                "Incomplete fragment without enough detail",
+                "Complete number theory problem",
+                "Incomplete text that references a missing diagram",
+                "Already solved complete problem",
+                "Another incomplete problem fragment",
+            ],
+            "label": [None, None, None, None, "7", None],
+            "source": ["math"] * 6,
+        }
+    )
+    annotation = DataAnnotationAgent(
+        config={
+            "project": {"modality": "text"},
+            "agents": {
+                "annotation": {
+                    "prompt": (
+                        "For rows with no label, solve complete problems when possible. "
+                        'Set "has_complete_problem" to false for incomplete rows and true otherwise.'
+                    )
+                },
+                "active_learning": {
+                    "task_prompt": "Train classification model to determine whether text contains a full problem, or an incomplete one",
+                    "batch_size": 2,
+                    "feature_columns": ["text"],
+                    "target_column": "annotation_label",
+                    "model": {"epochs": 16, "dim": 24, "bucket_size": 1024},
+                },
+            },
+        },
+        output_dir=output_dir,
+    )
+    monkeypatch.setattr(annotation, "_build_model_adapter", lambda: DummyAnnotationPromptAdapter())
+    active = ActiveLearningAgent(config=annotation.config, output_dir=output_dir)
+    monkeypatch.setattr(active, "_run_training_locally_with_code_agent", lambda **kwargs: _write_training_outputs(kwargs["artifacts"]))
+
+    runner = PipelineRunner([annotation, active])
+    result = runner.run({"dataframe": frame})
+
+    assert result.metadata["active_learning"]["target_column"] == "annotation_label"
+    assert result.artifacts["annotated_dataset"] == str(output_dir / "annotation" / "annotated_dataset.jsonl")
+    assert Path(result.artifacts["active_learning_dataset"]).exists()
+    assert Path(result.artifacts["active_learning_model"]).exists()
+
+
+def test_active_learning_trains_only_via_codeagent_execution(monkeypatch, tmp_path) -> None:
+    frame = pd.DataFrame(
+        {
+            "text": [
+                "complete problem statement",
+                "incomplete fragment",
+                "complete theorem statement",
+                "incomplete draft line",
+            ],
+            "is_complete": [True, False, True, False],
+        }
+    )
+    agent = ActiveLearningAgent(
+        config={
+            "agents": {
+                "active_learning": {
+                    "task_prompt": "Classify complete vs incomplete text",
+                    "feature_columns": ["text"],
+                    "target_column": "is_complete",
+                    "batch_size": 2,
+                    "max_steps": 5,
+                }
+            }
+        },
+        output_dir=tmp_path / "data",
+    )
+
+    calls = {"codeagent": 0}
+
+    def fake_codeagent_training(*, artifacts):
+        calls["codeagent"] += 1
+        output_dir = Path(artifacts.train_script_path).parent
+        model_path = output_dir / "model.pth"
+        metrics_path = output_dir / "training_metrics.json"
+        checkpoint = {
+            "architecture": "numpy_softmax",
+            "vectorizer": {"token_to_index": {"complete": 1, "incomplete": 2}, "unknown_index": 0},
+            "index_to_label": ["false", "true"],
+            "weights": [[0.0, 0.0], [1.0, -1.0], [-1.0, 1.0]],
+            "bias": [0.0, 0.0],
+        }
+        with model_path.open("wb") as handle:
+            pickle.dump(checkpoint, handle)
+        metrics_path.write_text(
+            '{"accuracy": 1.0, "macro_f1": 1.0, "evaluated_rows": 2, "train_rows": 2, "val_rows": 2, "backend": "torch"}',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(agent, "_run_training_locally_with_code_agent", fake_codeagent_training)
+
+    result = agent.execute({"dataframe": frame})
+    assert calls["codeagent"] == 1
+    assert result.metadata["active_learning"]["metrics"]["backend"] == "torch"
+
+
+def test_active_learning_defaults_to_annotation_label_and_excludes_null_rows(monkeypatch, tmp_path) -> None:
+    frame = pd.DataFrame(
+        {
+            "text": [
+                "complete example one",
+                "incomplete example one",
+                "complete example two",
+                "needs human annotation",
+            ],
+            "annotation_label": ["complete", "incomplete", "complete", None],
+        }
+    )
+    agent = ActiveLearningAgent(
+        config={
+            "agents": {
+                "active_learning": {
+                    "task_prompt": "Classify complete vs incomplete text",
+                    "feature_columns": ["text"],
+                    "batch_size": 2,
+                }
+            }
+        },
+        output_dir=tmp_path / "data",
+    )
+    monkeypatch.setattr(agent, "_run_training_locally_with_code_agent", lambda **kwargs: _write_training_outputs(kwargs["artifacts"]))
+
+    result = agent.execute({"dataframe": frame})
+
+    assert result.metadata["active_learning"]["target_column"] == "annotation_label"
+    assert result.metadata["active_learning"]["labeled_rows"] == 3
+    assert result.metadata["active_learning"]["pool_rows"] == 1
+
+
+def test_active_learning_split_is_stratified_by_target(tmp_path) -> None:
+    frame = pd.DataFrame(
+        {
+            "text": [f"row {index}" for index in range(20)],
+            "annotation_label": ["complete"] * 10 + ["incomplete"] * 10,
+        }
+    )
+    agent = ActiveLearningAgent(
+        config={
+            "agents": {
+                "active_learning": {
+                    "task_prompt": "Classify complete vs incomplete text",
+                    "feature_columns": ["text"],
+                    "target_column": "annotation_label",
+                    "test_size": 0.3,
+                }
+            }
+        },
+        output_dir=tmp_path / "data",
+    )
+
+    train_df, val_df = agent._split_train_test(frame, "annotation_label")
+
+    assert not val_df.empty
+    train_counts = train_df["annotation_label"].value_counts().to_dict()
+    val_counts = val_df["annotation_label"].value_counts().to_dict()
+    assert set(train_counts.keys()) == {"complete", "incomplete"}
+    assert set(val_counts.keys()) == {"complete", "incomplete"}
